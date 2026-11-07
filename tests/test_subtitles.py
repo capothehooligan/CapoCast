@@ -173,12 +173,12 @@ class Tab(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def cand(self, **kw):
-        base = dict(url="https://c/x.m3u8", kind="hls", duration=1400.0, height=1080, has_audio=True, has_video=True)
+        base = dict(url="https://c/x.m3u8", kind="hls", duration=1400.0, height=1080, width=1920, has_audio=True, has_video=True)
         return Candidate(**{**base, **kw})
 
     def test_subtitles_without_upscaling_are_a_burn_only_cast(self):
         self.assertEqual(self.tab._upscale_plan(self.cand(), "/tmp/s.ass"),
-                         {"mode": "burn", "duration": 1400.0, "audio": True, "subs": "/tmp/s.ass"})
+                         {"mode": "burn", "duration": 1400.0, "audio": True, "subs": "/tmp/s.ass", "hdr": False})
 
     def test_subtitles_with_upscaling_do_both(self):
         self.tab.upscale = "hq"
@@ -195,7 +195,7 @@ class Tab(unittest.TestCase):
 
     def test_a_pc_that_cannot_upscale_still_adds_subtitles(self):
         self.tab.upscale = "hq"
-        with mock.patch.object(upscaler, "missing", lambda mode="fast", subs=False: "no shaders" if mode != "burn" else ""):
+        with mock.patch.object(upscaler, "missing", lambda mode="fast", subs=False, hdr=False: "no shaders" if mode != "burn" else ""):
             plan = self.tab._upscale_plan(self.cand(), "/tmp/s.ass")
         self.assertEqual(plan["mode"], "burn")
 

@@ -132,7 +132,7 @@ def parse_hls(text, base_url=""):
     """Facts about a playlist: master or media, length, live, tallest rendition and its variant URLs."""
     from drm import key_line_is_drm
     info = {"valid": text.lstrip().startswith("#EXTM3U"), "master": False, "duration": 0.0, "live": False,
-            "height": 0, "variants": [], "drm": False, "audio": None, "video": None}
+            "height": 0, "width": 0, "variants": [], "drm": False, "audio": None, "video": None}
     codecs, audio_group = [], False
     ended, want_uri, pending = False, False, {}
     for raw in text.splitlines():
@@ -155,11 +155,12 @@ def parse_hls(text, base_url=""):
             info["drm"] = True
         elif not line.startswith("#") and want_uri:
             want_uri = False
-            height = 0
+            height = width = 0
             m = re.match(r"(\d+)x(\d+)", pending.get("RESOLUTION", ""))
             if m:
-                height = int(m.group(2))
+                width, height = int(m.group(1)), int(m.group(2))
             info["height"] = max(info["height"], height)
+            info["width"] = max(info["width"], width)
             info["variants"].append({"url": urllib.parse.urljoin(base_url, line), "height": height,
                                      "bandwidth": int(pending.get("BANDWIDTH", "0") or 0)})
     info["variants"].sort(key=lambda v: (v["height"], v["bandwidth"]), reverse=True)
@@ -186,7 +187,8 @@ def _iso_seconds(text):
 def parse_mpd(text):
     """Facts about a DASH manifest: length, live, tallest rendition, and whether it needs a DRM license."""
     import xml.etree.ElementTree as ET
-    info = {"valid": False, "duration": 0.0, "live": False, "height": 0, "drm": False, "audio": False, "video": False}
+    info = {"valid": False, "duration": 0.0, "live": False, "height": 0, "width": 0, "drm": False, "audio": False,
+            "video": False}
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
@@ -204,6 +206,8 @@ def parse_mpd(text):
             info["video"] = info["video"] or kind.startswith("video")
         if tag in ("Representation", "AdaptationSet") and el.get("height", "").isdigit():
             info["height"] = max(info["height"], int(el.get("height")))
+        if tag in ("Representation", "AdaptationSet") and el.get("width", "").isdigit():
+            info["width"] = max(info["width"], int(el.get("width")))
         if tag == "ContentProtection":
             scheme = (el.get("schemeIdUri") or "").lower()
             if scheme.startswith("urn:uuid:") and "e2719d58-a985-b3c9-781a-b030af78d30e" not in scheme:
@@ -220,6 +224,7 @@ class Candidate:
     size: int = 0                   # total bytes (mp4), 0 if unknown
     duration: float = 0.0           # seconds, 0 if unknown
     height: int = 0
+    width: int = 0                  # of the biggest rendition, 0 if unknown
     master: bool = False
     live: bool = False
     seen: int = 0                   # arrival order; a later request beats an earlier one (ads come first)
