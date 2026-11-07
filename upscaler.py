@@ -27,6 +27,8 @@ import time
 SEGMENT = 4             # seconds per piece; Roku recommends 4-6
 TARGET_W, TARGET_H = 3840, 2160
 MAX_BITRATE = 16_000_000
+GAIN_NEEDED = 1.3       # the shaders only run when the picture grows by more than this (their own //!WHEN rule), so
+                        # a source within 1.3x of 4K is just re-encoded: no detail added, a startup delay for nothing
 AUDIO_BITRATE = 192_000
 READ_RATE, BURST = 2.0, 60      # a 60 s head start, then twice real time. The TV plays smoothly once the encoder is
                                 # well ahead of it, so get there fast; an RTX 5060 manages 2.3x on HQ at 1080p
@@ -43,6 +45,43 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 QUIET_PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
 DIR_PREFIX = "capocast-upscale-"
 PIECE = re.compile(r"^([va])(\d{5})\.m4s$")
+# Simulated HDR. FFmpeg's own inverse tone mapping aims for PQ's full 10,000 nits (white really does land there), so the
+# curve is ours: everything up to the knee keeps its SDR brightness, and only the highlights above it rise to the peak.
+HDR_WHITE = 203         # nits for SDR white, the reference level in BT.2408
+HDR_PEAK = 500          # nits for the brightest thing in the picture. The number to tune by eye on the TV
+HDR_KNEE = 0.5          # the share of SDR's linear light left alone
+HDR_TRANSFERS = ("smpte2084", "arib-std-b67")   # a source with one of these is real HDR already
+HDR_TAGS = "color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv"
+
+
+def already_4k(width, height):
+    """True if upscaling can't add anything: the picture is at least 2160 tall, or - letterboxed films are 3840 wide
+    but only about 1600 tall - it would grow by 1.3x or less when fitted into 4K."""
+    if height >= TARGET_H:
+        return True
+    return bool(width and height) and min(TARGET_W / width, TARGET_H / height) <= GAIN_NEEDED
+
+
+def hdr_shader():
+    """A libplacebo hook that brightens the highlights. It runs on linear light, where 1.0 is SDR white, and the
+    brightest of the three channels sets the gain for all three, so a colour gets brighter without changing hue.
+    libplacebo does the rest: BT.709 to BT.2020 and the PQ curve."""
+    return f"""//!HOOK LINEAR
+//!BIND HOOKED
+//!DESC simulated HDR
+const float WHITE = {HDR_WHITE:.1f};
+const float PEAK = {HDR_PEAK:.1f};
+const float KNEE = {HDR_KNEE:.3f};
+vec4 hook() {{
+    vec4 c = HOOKED_texOff(vec2(0.0));
+    vec3 rgb = clamp(c.rgb, 0.0, 1.0);    // a scaler overshoots SDR's range at sharp edges: ringing, not light
+    float top = max(max(rgb.r, rgb.g), rgb.b);
+    if (top <= KNEE) return vec4(rgb, c.a);
+    float t = (top - KNEE) / (1.0 - KNEE);
+    float nits = WHITE * top + (PEAK - WHITE) * t * t;
+    return vec4(rgb * (nits / WHITE / top), c.a);
+}}
+"""
 
 
 def font_source():
@@ -55,9 +94,10 @@ def shader_path(mode):
     return os.path.join(base, "assets", *MODES[mode].split("/"))
 
 
-def missing(mode="fast", subs=False):
-    """Why upscaling (or, with mode='burn', adding subtitles) can't run on this PC, in plain words, or '' if it can."""
-    what = "Subtitles need" if mode == BURN else "Upscaling needs"
+def missing(mode="fast", subs=False, hdr=False):
+    """Why upscaling (or, with mode='burn', adding subtitles and/or HDR) can't run on this PC, in plain words, or ''
+    if it can."""
+    what = ("Subtitles need" if subs else "HDR needs") if mode == BURN else "Upscaling needs"
     exe = shutil.which("ffmpeg")
     if not exe:
         return f"{what} FFmpeg on your PATH."
@@ -70,7 +110,7 @@ def missing(mode="fast", subs=False):
             return ""
 
     filters = listing("-filters")
-    if mode != BURN and "libplacebo" not in filters:
+    if (mode != BURN or hdr) and "libplacebo" not in filters:
         return "This FFmpeg has no libplacebo. Install the full build: winget install Gyan.FFmpeg"
     if (subs or mode == BURN) and " subtitles " not in filters:
         return "This FFmpeg can't draw subtitles. Install the full build: winget install Gyan.FFmpeg"
@@ -80,24 +120,29 @@ def missing(mode="fast", subs=False):
 
 
 def probe(url, headers, kind, log=lambda m: None):
-    """What FFmpeg itself sees in a stream: {'duration', 'height', 'audio', 'video'}, or None if it can't read it."""
+    """What FFmpeg itself sees in a stream: {'duration', 'height', 'width', 'transfer', 'audio', 'video'}, or None if
+    it can't read it."""
     exe = shutil.which("ffprobe")
     if not exe:
         return None
     try:
         out = subprocess.run([exe, "-v", "error", *_input_options(headers, kind), "-show_entries",
-                              "stream=codec_type,height:format=duration", "-of", "default=nw=1", url],
+                              "stream=codec_type,width,height,color_transfer:format=duration", "-of", "default=nw=1", url],
                              capture_output=True, timeout=25, creationflags=NO_WINDOW).stdout.decode(errors="replace")
     except Exception as e:
         log(f"upscale probe failed: {e!r}")
         return None
-    info = {"duration": 0.0, "height": 0, "audio": False, "video": False}
+    info = {"duration": 0.0, "height": 0, "width": 0, "transfer": "", "audio": False, "video": False}
     for line in out.splitlines():
         key, _, value = line.partition("=")
         if key == "codec_type" and value in ("audio", "video"):
             info[value] = True
         elif key == "height" and value.isdigit():
             info["height"] = max(info["height"], int(value))
+        elif key == "width" and value.isdigit():
+            info["width"] = max(info["width"], int(value))
+        elif key == "color_transfer" and value != "unknown":
+            info["transfer"] = value
         elif key == "duration":
             try:
                 info["duration"] = float(value)
@@ -132,7 +177,25 @@ def subtitle_filter(begin):
     return f"setpts=PTS+{begin}/TB,subtitles=../subs.ass:fontsdir=../fonts,setpts=PTS-{begin}/TB"
 
 
-def command(exe, url, headers, kind, first, audio, mode="fast", subs=False):
+def hdr_stage():
+    """The GPU stage that lifts the highlights and tags the result as BT.2020 PQ in 10 bits."""
+    return f"libplacebo=format=p010le:custom_shader_path=../hdr.glsl:{HDR_TAGS}"
+
+
+def hdr_filter():
+    """The HDR stage for a picture that has come back to the PC (to be drawn on, or never upscaled): it arrives as
+    ordinary 8-bit SDR, so it is labelled as such, sent back to the GPU and fetched again."""
+    return ("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,hwupload,"
+            f"{hdr_stage()},hwdownload,format=p010le")
+
+
+def dim_subtitles(ass_text):
+    """Subtitles are drawn before the highlights are lifted, so plain white words would come out at the peak
+    brightness. A light grey ends up near where they'd be on an ordinary screen."""
+    return re.sub(r"^(Style:.*)$", lambda m: m.group(1).replace("&Hffffff", "&Hc8c8c8"), ass_text, flags=re.M)
+
+
+def command(exe, url, headers, kind, first, audio, mode="fast", subs=False, hdr=False):
     """The FFmpeg command that makes pieces from number `first` on. It runs inside a folder next to shader.glsl (and
     subs.ass and fonts/, when there are subtitles), so no Windows path has to survive FFmpeg's filter syntax."""
     begin = first * SEGMENT
@@ -140,21 +203,32 @@ def command(exe, url, headers, kind, first, audio, mode="fast", subs=False):
     # pieces of a restarted encoder, which don't get that shift.
     if mode == BURN:
         picture = (subtitle_filter(begin) + ",") * bool(subs) + "format=yuv420p"
-        device = []
     else:
+        # Upscale and HDR with nothing drawn between them stay on the GPU: copying every 4K frame back to the PC and up
+        # again between the two cost a third of the speed (1.15x real time against 1.6x). 10 bits between them, so
+        # lifting the highlights doesn't stretch 8-bit steps into bands.
+        chained = hdr and not subs
         picture = (f"format=yuv420p,hwupload,libplacebo=w={TARGET_W}:h={TARGET_H}:force_original_aspect_ratio=decrease:"
-                   "force_divisible_by=2:format=nv12:custom_shader_path=../shader.glsl,hwdownload,format=nv12")
-        if subs:
-            picture += ",format=yuv420p," + subtitle_filter(begin)
-        device = ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
+                   f"force_divisible_by=2:format={'p010le' if chained else 'nv12'}:custom_shader_path=../shader.glsl")
+        if chained:
+            picture += f",{hdr_stage()},hwdownload,format=p010le"
+        else:
+            picture += ",hwdownload,format=nv12"
+            if subs:
+                picture += ",format=yuv420p," + subtitle_filter(begin)
+    device = ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"] if (mode != BURN or hdr) else []
+    if hdr and (mode == BURN or subs):                  # those pictures are on the PC, as yuv420p, and go back up
+        picture += "," + hdr_filter()
     cmd = [exe, "-nostdin", "-hide_banner", "-loglevel", "warning", *device,
            *_input_options(headers, kind),
            "-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "5",
            "-readrate", str(READ_RATE), "-readrate_initial_burst", str(BURST), "-ss", str(begin), "-i", url,
            "-an", "-sn", "-dn", "-vf", picture,
-           "-c:v", "hevc_nvenc", "-preset", "p4", "-profile:v", "main", "-level:v", "5.1", "-tier", "main", "-bf", "0",
+           "-c:v", "hevc_nvenc", "-preset", "p4", "-profile:v", "main10" if hdr else "main", "-level:v", "5.1",
+           "-tier", "main", "-bf", "0",
            "-rc", "vbr", "-cq", "24", "-maxrate", str(MAX_BITRATE), "-bufsize", str(2 * MAX_BITRATE),
            "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT})", "-forced-idr", "1", "-tag:v", "hvc1",
+           *(["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc"] if hdr else []),
            "-output_ts_offset", str(begin), *_hls_output("v", first)]
     if audio:
         # first_pts: a source's audio can begin after its picture, and pieces are cut from the first audio packet, so
@@ -165,10 +239,11 @@ def command(exe, url, headers, kind, first, audio, mode="fast", subs=False):
     return cmd
 
 
-def master_playlist(audio, mode="fast"):
+def master_playlist(audio, mode="fast", hdr=False):
     group = ',AUDIO="a"' if audio else ""
     size = "" if mode == BURN else f",RESOLUTION={TARGET_W}x{TARGET_H}"      # a subtitles-only cast keeps its own size
-    codecs = "hvc1.1.6.L153.B0" + (",mp4a.40.2" if audio else "")
+    codecs = ("hvc1.2.4.L153.B0" if hdr else "hvc1.1.6.L153.B0") + (",mp4a.40.2" if audio else "")
+    size += ",VIDEO-RANGE=PQ" * bool(hdr)
     lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
     if audio:
         lines.append('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"')
@@ -209,9 +284,10 @@ class UpscaleSession:
 
     kind, entry_name = "hls", "index.m3u8"
 
-    def __init__(self, url, headers, kind, token, start, duration, mode, audio, log=lambda m: None, subs=None):
+    def __init__(self, url, headers, kind, token, start, duration, mode, audio, log=lambda m: None, subs=None,
+                 hdr=False):
         self.url, self.headers, self.source_kind, self.token = url, headers, kind, token
-        self.mode, self.subs = mode, bool(subs)
+        self.mode, self.subs, self.hdr = mode, bool(subs), bool(hdr)
         self.duration, self.audio, self.log = float(duration), bool(audio), log
         self.start, self.actual_start = float(start or 0.0), (None if start else 0.0)
         self.created, self.hits, self.error, self.failures = time.time(), 0, "", []
@@ -229,8 +305,16 @@ class UpscaleSession:
         self.dir = tempfile.mkdtemp(prefix=DIR_PREFIX)
         if mode != BURN:
             shutil.copyfile(shader_path(mode), os.path.join(self.dir, "shader.glsl"))
+        if hdr:
+            with open(os.path.join(self.dir, "hdr.glsl"), "w", newline="\n") as f:
+                f.write(hdr_shader())
         if subs:
             shutil.copyfile(subs, os.path.join(self.dir, "subs.ass"))
+            if hdr:
+                with open(subs, encoding="utf-8-sig", errors="replace") as f:
+                    text = f.read()
+                with open(os.path.join(self.dir, "subs.ass"), "w", encoding="utf-8", newline="") as f:
+                    f.write(dim_subtitles(text))
             fonts = os.path.join(self.dir, "fonts")
             os.mkdir(fonts)
             for name in os.listdir(font_source()):
@@ -244,7 +328,7 @@ class UpscaleSession:
     def playlist(self, name):
         """Text of a playlist this session serves, or None if `name` isn't one."""
         if name == self.entry_name:
-            return master_playlist(self.audio, self.mode)
+            return master_playlist(self.audio, self.mode, self.hdr)
         if name == "video.m3u8":
             return media_playlist("v", self.duration)
         if name == "audio.m3u8" and self.audio:
@@ -326,7 +410,7 @@ class UpscaleSession:
         self.log(f"upscale: encoding from {first * SEGMENT}s")
         with open(os.path.join(run, "ffmpeg.log"), "wb") as err:
             self.proc = subprocess.Popen(command(exe, self.url, self.headers, self.source_kind, first, self.audio,
-                                                   self.mode, self.subs),
+                                                   self.mode, self.subs, self.hdr),
                                          cwd=run, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
                                          creationflags=NO_WINDOW | QUIET_PRIORITY)
 

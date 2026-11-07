@@ -275,14 +275,14 @@ class MediaRelay:
         """Register a stream; returns the URL to give the Roku. HLS can begin `start` seconds in."""
         return self._keep(Session(url, headers, kind, secrets.token_hex(8), start if kind == "hls" else 0.0))
 
-    def add_upscaled(self, url, headers, kind, start, duration, mode, audio, subs=None):
+    def add_upscaled(self, url, headers, kind, start, duration, mode, audio, subs=None, hdr=False):
         """Like add(), but the TV gets a copy made on this PC: upscaled to 4K, with subtitles (a file at `subs`) burned
-        in, or both. Any kind of stream can begin `start` seconds in. One encoder at a time: the GPU has one TV to feed,
+        in, with simulated HDR (`hdr`), or any of them. Any kind of stream can begin `start` seconds in. One encoder at a time: the GPU has one TV to feed,
         so this replaces any upscale already running."""
         self.stop_upscaling()
         sent = {**{"User-Agent": UA}, **replay_headers(headers)}
         return self._keep(UpscaleSession(url, sent, kind, secrets.token_hex(8), start, duration, mode, audio, self.log,
-                                     subs))
+                                     subs, hdr))
 
     def stop_upscaling(self):
         with self._lock:
@@ -512,7 +512,8 @@ def probe_dash(cand):
         raise DrmError("This stream is DRM-protected, which CapoCast won't cast.")
     if not info["valid"]:
         raise ValueError("not a manifest")
-    cand.height, cand.duration, cand.live, cand.master = info["height"], info["duration"], info["live"], True
+    cand.height, cand.width = info["height"], info["width"]
+    cand.duration, cand.live, cand.master = info["duration"], info["live"], True
     cand.has_audio, cand.has_video = info["audio"] or None, info["video"] or None
     return []
 
@@ -527,7 +528,7 @@ def probe_hls(cand):
         raise DrmError("This stream is DRM-protected, which CapoCast won't cast.")
     if not info["valid"]:
         raise ValueError("not a playlist")
-    cand.master, cand.height, covered = info["master"], info["height"], []
+    cand.master, cand.height, cand.width, covered = info["master"], info["height"], info["width"], []
     cand.has_audio, cand.has_video = info["audio"], info["video"]
     if info["master"] and info["variants"]:
         covered = [v["url"] for v in info["variants"]]

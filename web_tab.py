@@ -74,7 +74,7 @@ def ytdlp_candidate(page_url):
                         "HLS, DASH and MP4).")
     return Candidate(url=url, kind=kind, headers=info.get("http_headers") or {},
                      duration=float(info.get("duration") or 0), height=int(info.get("height") or 0),
-                     live=bool(info.get("is_live")))
+                     width=int(info.get("width") or 0), live=bool(info.get("is_live")))
 
 
 class Tv:
@@ -96,19 +96,21 @@ class Tv:
 class WebTab:
     discord, cast_since = None, 0.0                       # defaults for anything built without __init__
     upscale_owner, tv_gone, cast_image, cast_session = None, 0, None, None
+    hdr = False                                           # the setting; __init__ gives each tab its own
     cast_end = None                                           # when the video will end by Discord's clock, if its length is known
     subs, sub_dir = "", None                                  # subtitle language chosen ('' = off); folder for fetched files
     cast_site = ""                                           # the site being cast from, for the Discord status
 
     SOURCE = "web"                                        # this tab's name in the shared Discord status
 
-    def __init__(self, app, page, ui, home=None, upscale=None, discord=None, subs=""):
+    def __init__(self, app, page, ui, home=None, upscale=None, discord=None, subs="", hdr=False):
         self.app, self.page, self.ui = app, page, ui
         self.discord = discord                            # discord_presence.Status, shared with the YouTube tab
         self.cast_since = 0.0                             # when the current cast began, for Discord's timer
         self.home = home or HOME
         self.upscale = upscale if upscale in UPSCALE_NAMES else "off"
         self.subs = str(subs or "").strip().lower()
+        self.hdr = bool(hdr)                              # lift SDR video to (simulated) HDR on this PC
         self.upscaled = None                              # what the TV's upscaled cast was made with, while there is one
         self.guard = WebGuard(ui.log, home=self.home)
         self.guard.on_youtube = self._youtube_tapped
@@ -167,6 +169,8 @@ class WebTab:
         self.continue_lbl = chip("Continue", self.show_continue, "Pick up a show where you left off")
         self.upscale_lbl = chip("", self.next_upscale, "Sharpen the picture to 4K on this PC before it goes to the TV")
         self._paint_upscale()
+        self.hdr_lbl = chip("", self.toggle_hdr, "Lift the highlights to HDR on this PC before it goes to the TV")
+        self._paint_hdr()
         self.subs_lbl = chip("", self.next_subs, "Draw subtitles onto the video on this PC")
         self._paint_subs()
         self.discord_lbl = chip("", self.toggle_discord, "Show what you're watching on Discord")
@@ -330,6 +334,22 @@ class WebTab:
         on = self.upscale != "off"
         self.upscale_lbl.config(text="Upscale: " + UPSCALE_NAMES[self.upscale], fg=self.ui.ACCENT if on else self.ui.MUTED)
 
+    def _paint_hdr(self):
+        self.hdr_lbl.config(text="HDR: " + ("On" if self.hdr else "Off"), fg=self.ui.ACCENT if self.hdr else self.ui.MUTED)
+
+    def toggle_hdr(self):
+        """Clicking the label turns the simulated HDR on or off. It applies from the next cast."""
+        self.hdr = not self.hdr
+        why = upscaler.missing(upscaler.BURN, False, True) if self.hdr else ""
+        if why:
+            self.hdr = False
+            self._note(why, self.ui.AMBER, 12)
+        self._paint_hdr()
+        self._save_settings()
+        if self.hdr:
+            self._note("Next cast: simulated HDR, made on this PC's GPU (the TV switches to its HDR mode)",
+                       self.ui.MUTED, 6)
+
     def _paint_subs(self):
         self.subs_lbl.config(text="Subtitles: " + (self.subs.title() or "Off"),
                              fg=self.ui.ACCENT if self.subs else self.ui.MUTED)
@@ -452,6 +472,8 @@ class WebTab:
             state += f" · {name} upscale" if "4K" in name else f" · 4K upscale ({name})"      # never says 4K twice
         if plan.get("subs"):
             state += " · subtitles"
+        if plan.get("hdr"):
+            state += " · HDR"
         extra = {"end": self.cast_end} if self.cast_end else {}
         self.discord.show(self.SOURCE, f"Watching {title}", state, self.cast_since or None, image,
                           image_text=f"{title} · {site}" if site else title, **extra)
@@ -1147,48 +1169,59 @@ class WebTab:
         """What the PC makes for this cast: {'mode', 'duration', 'audio', 'subs'}, or None to cast it as it is (saying
         why, so a switch being on and the TV looking the same is never a mystery). The mode is the Upscale setting; with
         subtitles chosen and no upscaling they're drawn onto the video at its own size ('burn')."""
-        mode = self.upscale if self.upscale != "off" else (upscaler.BURN if subs else "off")
+        hdr = self.hdr
+        mode = self.upscale if self.upscale != "off" else (upscaler.BURN if (subs or hdr) else "off")
         if mode == "off":
             return None
         ui, burn = self.ui, mode == upscaler.BURN
-        why = upscaler.missing(mode, bool(subs))
-        if why and subs and not burn:
-            ui.log(f"upscale unavailable ({why}); trying subtitles alone")
+        why = upscaler.missing(mode, bool(subs), hdr)
+        if why and (subs or hdr) and not burn:
+            ui.log(f"upscale unavailable ({why}); trying {'subtitles' if subs else 'HDR'} alone")
             mode, burn = upscaler.BURN, True
-            why = upscaler.missing(mode, True)
+            why = upscaler.missing(mode, bool(subs), hdr)
+            if why and subs and hdr:
+                hdr = False                                   # no libplacebo: the subtitles don't need it
+                why = upscaler.missing(mode, True)
+        what = "subtitles" if subs else "HDR"                 # what a burn-only cast is adding
         if not why and cand.live:
-            why = "Live streams can't have subtitles added" if burn else "Live streams aren't upscaled"
+            why = f"Live streams can't have {what} added" if burn else "Live streams aren't upscaled"
         info = None
-        if not why and (not cand.duration or not cand.height or cand.has_audio is None):
+        if not why and (hdr or not cand.duration or not cand.height or not cand.width or cand.has_audio is None):
             self._post(lambda: self._note("Reading the video…", ui.AMBER, 30))
             info = upscaler.probe(cand.url, cand.headers, cand.kind, ui.log)
         duration = cand.duration or (info or {}).get("duration") or 0
         height = cand.height or (info or {}).get("height") or 0
+        width = cand.width or (info or {}).get("width") or 0
         audio = cand.has_audio if cand.has_audio is not None else (info or {}).get("audio", True)
         if not why and not duration:
-            why = ("Can't add subtitles to this one" if burn else "Can't upscale this one") + ": its length isn't known"
+            why = (f"Can't add {what} to this one" if burn else "Can't upscale this one") + ": its length isn't known"
         if not why and cand.has_video is False:
-            why = "This stream has no picture to " + ("add subtitles to" if burn else "upscale")
-        if not why and not burn and height >= upscaler.TARGET_H:
-            if subs:
-                mode, burn = upscaler.BURN, True                  # already 4K: no upscaling, but the subtitles still go on
+            why = "This stream has no picture to " + (f"add {what} to" if burn else "upscale")
+        if not why and hdr and (info or {}).get("transfer") in upscaler.HDR_TRANSFERS:
+            hdr = False                                           # already HDR: lifting it again would wreck it
+            if burn and not subs:
+                why = "This video is already HDR"
+        if not why and not burn and upscaler.already_4k(width, height):
+            if subs or hdr:
+                mode, burn = upscaler.BURN, True                  # already 4K: no upscaling, but the extras still go on
             else:
                 why = "This video is already 4K"
         if why:
-            ui.log(f"{'subtitles' if burn else 'upscale'} skipped: {why}")
+            ui.log(f"{what if burn else 'upscale'} skipped: {why}")
             self._post(lambda: self._note(why + ", casting it as it is", ui.AMBER, 8))
             return None
-        return {"mode": mode, "duration": duration, "audio": bool(audio), "subs": subs or None}
+        return {"mode": mode, "duration": duration, "audio": bool(audio), "subs": subs or None, "hdr": hdr}
 
     def _start_upscale(self, attempt, relay, cand, start, plan):
         """Start the encoder and wait for its first piece. Returns the URL for the TV, or None to cast plainly."""
         ui = self.ui
-        doing = ("Adding subtitles" if plan["mode"] == upscaler.BURN else f"Upscaling ({UPSCALE_NAMES[plan['mode']]})"
-                 + (" with subtitles" if plan.get("subs") else ""))
+        extras = " and ".join(n for n, on in (("subtitles", plan.get("subs")), ("HDR", plan.get("hdr"))) if on)
+        doing = (f"Adding {extras}" if plan["mode"] == upscaler.BURN
+                 else f"Upscaling ({UPSCALE_NAMES[plan['mode']]})" + (f" with {extras}" if extras else ""))
         self._post(lambda: self._note(doing + "…", ui.AMBER, 60))
         self.upscale_owner = attempt                      # so a failure of this attempt (and only this one) stops it
         url = relay.add_upscaled(cand.url, cand.headers, cand.kind, start, plan["duration"], plan["mode"], plan["audio"],
-                                 plan.get("subs"))
+                                 plan.get("subs"), plan.get("hdr", False))
         sess = relay.session_for(url)
         try:
             ready = sess.wait_ready(lambda: self._check(attempt))
@@ -1200,7 +1233,7 @@ class WebTab:
             return url
         ui.log(f"upscale failed, casting plainly: {sess.error}")
         relay.stop_upscaling()
-        failed = "Adding subtitles" if plan["mode"] == upscaler.BURN else "Upscaling"
+        failed = f"Adding {extras}" if plan["mode"] == upscaler.BURN else "Upscaling"
         self._post(lambda: self._note(f"{failed} failed, casting it as it is", ui.AMBER, 8))
         return None
 
@@ -1269,7 +1302,9 @@ class WebTab:
             if not slow and getattr(sess, "stalls", 0) >= 3 and self.upscaled:
                 slow = True                                   # a seek swaps the session in the plan, so this follows it
                 if (self.upscaled or {}).get("mode") == upscaler.BURN:
-                    msg = ("Adding the subtitles is running slower than the video, so the TV may buffer. The site may "
+                    extras = " and ".join(n for n, on in (("subtitles", self.upscaled.get("subs")),
+                                                          ("HDR", self.upscaled.get("hdr"))) if on)
+                    msg = (f"Adding the {extras} is running slower than the video, so the TV may buffer. The site may "
                            "be slow, or the GPU busy.")
                 else:
                     msg = ("Upscaling is running slower than the video, so the TV may buffer. The site may be slow, or "
@@ -1281,8 +1316,13 @@ class WebTab:
         if self.upscaled:
             plan = self.upscaled
             public = relay.add_upscaled(url, headers, kind, start, plan["duration"], plan["mode"], plan["audio"],
-                                        plan.get("subs"))
+                                        plan.get("subs"), plan.get("hdr", False))
             plan["session"] = relay.session_for(public)
+            # The TV isn't told about the new stream until its first piece exists. A restarted encoder has to open the
+            # site and start up again, and a TV that asks sooner gets nothing, gives up, and shows a playback error.
+            wait = getattr(plan["session"], "wait_ready", None)
+            if wait:
+                wait(lambda: None, 40.0)
         else:
             public = relay.add(url, headers, kind, start)
         self.cast_session = relay.session_for(public)

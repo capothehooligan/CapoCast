@@ -1844,7 +1844,7 @@ class App(tk.Tk):
                              RoundButton=RoundButton, NavButton=NavButton, Chip=Chip, Tooltip=Tooltip,
                              dark_titlebar=dark_titlebar, Remote=Remote, log=log)
         self.web = web_tab.WebTab(self, self.pages["Web"], ui, cfg.get("web_home"), cfg.get("web_upscale"), self.discord,
-                                 subs=cfg.get("web_subs", ""))
+                                 subs=cfg.get("web_subs", ""), hdr=cfg.get("web_hdr", False))
         self.page = None
         self._show("YouTube" if "--youtube" in sys.argv else "Web" if "--web" in sys.argv else "Listen")
 
@@ -2608,6 +2608,7 @@ class App(tk.Tk):
                            "web_home": getattr(getattr(self, "web", None), "home", None),
                            "web_upscale": getattr(getattr(self, "web", None), "upscale", "off"),
                            "web_subs": getattr(getattr(self, "web", None), "subs", ""),
+                           "web_hdr": getattr(getattr(self, "web", None), "hdr", False),
                            "discord_id": self.discord.client_id,
                            "discord_on": self.discord.enabled.get("web", False),
                            "discord_youtube": self.discord.enabled.get("youtube", False),

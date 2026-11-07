@@ -83,6 +83,92 @@ class Command(unittest.TestCase):
         self.assertIn("v.m3u8", cmd)
 
 
+class Hdr(unittest.TestCase):
+    def build(self, **kw):
+        return command("ffmpeg", "https://cdn/x", {}, "hls", 3, True, **kw)
+
+    def value(self, cmd, flag):
+        return cmd[cmd.index(flag) + 1]
+
+    def test_without_hdr_nothing_about_it_is_in_the_command(self):
+        cmd = self.build()
+        self.assertEqual(self.value(cmd, "-profile:v"), "main")
+        self.assertNotIn("hdr.glsl", self.value(cmd, "-vf"))
+        self.assertNotIn("-color_trc", cmd)
+
+    def test_hdr_is_ten_bit_pq_with_the_highlights_lifted_last(self):
+        cmd = self.build(hdr=True)
+        self.assertEqual(self.value(cmd, "-profile:v"), "main10")
+        self.assertEqual((self.value(cmd, "-color_primaries"), self.value(cmd, "-color_trc"),
+                          self.value(cmd, "-colorspace")), ("bt2020", "smpte2084", "bt2020nc"))
+        picture = self.value(cmd, "-vf")
+        self.assertTrue(picture.endswith("hwdownload,format=p010le"))
+        self.assertIn("custom_shader_path=../hdr.glsl", picture)
+        self.assertIn("-init_hw_device", cmd)                       # the GPU is needed even with nothing to upscale
+
+    def test_upscale_and_hdr_stay_on_the_gpu_when_nothing_is_drawn_between_them(self):
+        picture = self.value(self.build(mode="hq", hdr=True), "-vf")
+        self.assertEqual(picture.count("hwupload"), 1)              # one trip to the GPU...
+        self.assertEqual(picture.count("hwdownload"), 1)            # ...and one back, with both stages in between
+        self.assertLess(picture.index("shader.glsl"), picture.index("hdr.glsl"))
+        self.assertIn("format=p010le:custom_shader_path=../shader.glsl", picture)   # 10 bits between the stages
+
+    def test_with_subtitles_the_picture_has_to_come_back_to_be_drawn_on(self):
+        picture = self.value(self.build(mode="hq", subs=True, hdr=True), "-vf")
+        self.assertEqual(picture.count("hwdownload"), 2)
+
+    def test_the_upscale_comes_before_hdr_and_subtitles_before_both(self):
+        picture = self.value(self.build(mode="hq", subs=True, hdr=True), "-vf")
+        self.assertLess(picture.index("shader.glsl"), picture.index("subtitles="))
+        self.assertLess(picture.index("subtitles="), picture.index("hdr.glsl"))
+
+    def test_hdr_alone_keeps_the_videos_own_size(self):
+        picture = self.value(self.build(mode="burn", hdr=True), "-vf")
+        self.assertEqual(picture.count("libplacebo"), 1)            # only the HDR stage; no upscale to 3840x2160
+        self.assertNotIn("w=3840", picture)
+
+    def test_the_playlist_tells_the_tv_it_is_hdr10(self):
+        text = master_playlist(True, "fast", True)
+        self.assertIn("VIDEO-RANGE=PQ", text)
+        self.assertIn("hvc1.2.4.L153.B0", text)
+        plain = master_playlist(True, "fast")
+        self.assertNotIn("VIDEO-RANGE", plain)
+        self.assertIn("hvc1.1.6.L153.B0", plain)
+
+    def test_the_shader_keeps_dark_and_mid_tones_and_lifts_only_the_top(self):
+        text = upscaler.hdr_shader()
+        self.assertIn("//!HOOK LINEAR", text)
+        for name, value in (("WHITE", upscaler.HDR_WHITE), ("PEAK", upscaler.HDR_PEAK), ("KNEE", upscaler.HDR_KNEE)):
+            self.assertIn(f"const float {name} = {float(value)}", text.replace("0.500", "0.5"))
+        self.assertIn("if (top <= KNEE) return vec4(rgb, c.a);", text)   # below the knee the picture is untouched
+        self.assertIn("clamp(c.rgb, 0.0, 1.0)", text)               # a scaler's overshoot is not light to be boosted
+        self.assertLess(upscaler.HDR_KNEE, 1.0)
+        self.assertGreater(upscaler.HDR_PEAK, upscaler.HDR_WHITE)
+
+    def test_white_subtitles_are_dimmed_so_they_are_not_blinding(self):
+        ass = "[V4+ Styles]\nStyle: Default,Roboto,19,&Hffffff,&Hffffff,&H000000,&H80000000,1\n[Events]\nDialogue: &Hffffff\n"
+        out = upscaler.dim_subtitles(ass)
+        self.assertIn("Style: Default,Roboto,19,&Hc8c8c8,&Hc8c8c8,&H000000", out)
+        self.assertIn("Dialogue: &Hffffff", out)                    # only the style line
+
+    def test_an_hdr_session_writes_its_shader_and_dims_its_subtitles(self):
+        import tempfile
+        FakeEncoder.made = []
+        subs = os.path.join(tempfile.mkdtemp(), "s.ass")
+        with open(subs, "w", encoding="utf-8") as f:
+            f.write("Style: Default,Roboto,19,&Hffffff,&Hffffff,&H000000\n")
+        with mock.patch.object(upscaler.subprocess, "Popen", FakeEncoder), \
+                mock.patch.object(upscaler.shutil, "which", lambda n: "ffmpeg"):
+            sess = UpscaleSession("https://c/x", {}, "hls", "tok", 0.0, 60.0, "burn", True, subs=subs, hdr=True)
+            self.addCleanup(sess.close)
+            with open(os.path.join(sess.dir, "hdr.glsl")) as f:
+                self.assertIn("simulated HDR", f.read())
+            with open(os.path.join(sess.dir, "subs.ass")) as f:
+                self.assertIn("&Hc8c8c8", f.read())
+            self.assertIn("VIDEO-RANGE=PQ", sess.playlist("index.m3u8"))
+            self.assertIn("main10", FakeEncoder.made[-1].cmd)
+
+
 class FakeEncoder:
     """Stands in for FFmpeg: the test decides what it has 'made' by writing files into its folder."""
     made = []
@@ -467,7 +553,7 @@ class Tab(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def cand(self, **kw):
-        base = dict(url="https://c/x.m3u8", kind="hls", duration=1400.0, height=1080, has_audio=True, has_video=True)
+        base = dict(url="https://c/x.m3u8", kind="hls", duration=1400.0, height=1080, width=1920, has_audio=True, has_video=True)
         return Candidate(**{**base, **kw})
 
     def test_off_means_off(self):
@@ -478,13 +564,13 @@ class Tab(unittest.TestCase):
     def test_a_normal_video_gets_a_plan_with_no_extra_probe(self):
         with mock.patch.object(upscaler, "probe", side_effect=AssertionError("no need to probe")):
             plan = self.tab._upscale_plan(self.cand())
-        self.assertEqual(plan, {"mode": "fast", "duration": 1400.0, "audio": True, "subs": None})
+        self.assertEqual(plan, {"mode": "fast", "duration": 1400.0, "audio": True, "subs": None, "hdr": False})
 
     def test_what_the_page_didnt_say_is_probed_for(self):
         info = {"duration": 90.0, "height": 720, "audio": False, "video": True}
         with mock.patch.object(upscaler, "probe", return_value=info):
             plan = self.tab._upscale_plan(self.cand(kind="mp4", duration=0.0, height=0, has_audio=None))
-        self.assertEqual(plan, {"mode": "fast", "duration": 90.0, "audio": False, "subs": None})
+        self.assertEqual(plan, {"mode": "fast", "duration": 90.0, "audio": False, "subs": None, "hdr": False})
 
     def test_skipping_always_says_why(self):
         for cand, words in ((self.cand(live=True), "Live"), (self.cand(height=2160), "already 4K"),
@@ -492,6 +578,75 @@ class Tab(unittest.TestCase):
             self.notes.clear()
             self.assertIsNone(self.tab._upscale_plan(cand))
             self.assertIn(words, self.notes[-1])
+
+    def test_a_letterboxed_film_that_is_nearly_4k_wide_is_not_upscaled(self):
+        # 3832x1600: under 2160 tall, but fitting it into 4K grows it by 0.2%, so the shaders would never run
+        self.assertIsNone(self.tab._upscale_plan(self.cand(height=1600, width=3832)))
+        self.assertIn("already 4K", self.notes[-1])
+        self.assertTrue(upscaler.already_4k(3840, 1604))
+        self.assertTrue(upscaler.already_4k(3000, 1250))        # 1.28x: under the shaders' 1.3x rule
+        self.assertFalse(upscaler.already_4k(2880, 1200))       # 1.33x: they run
+        self.assertFalse(upscaler.already_4k(1920, 1080))
+        self.assertFalse(upscaler.already_4k(2560, 1080))       # 1.5x
+        self.assertFalse(upscaler.already_4k(0, 1080))          # width unknown: only the height rule applies
+
+    def test_hdr_alone_is_a_burn_only_cast_that_reads_the_video_first(self):
+        self.tab.upscale, self.tab.hdr = "off", True
+        info = {"duration": 0.0, "height": 1080, "width": 1920, "transfer": "bt709", "audio": True, "video": True}
+        with mock.patch.object(upscaler, "probe", return_value=info) as probed:
+            plan = self.tab._upscale_plan(self.cand())
+        probed.assert_called_once()
+        self.assertEqual((plan["mode"], plan["hdr"], plan["subs"]), ("burn", True, None))
+
+    def test_a_nearly_4k_film_still_gets_hdr_when_upscaling_is_on(self):
+        self.tab.hdr = True
+        with mock.patch.object(upscaler, "probe", return_value={"transfer": "bt709"}):
+            plan = self.tab._upscale_plan(self.cand(height=1600, width=3832))
+        self.assertEqual((plan["mode"], plan["hdr"]), ("burn", True))   # no re-upscale, but the HDR still goes on
+
+    def test_a_video_that_is_already_hdr_is_left_alone(self):
+        self.tab.upscale, self.tab.hdr = "off", True
+        with mock.patch.object(upscaler, "probe", return_value={"transfer": "smpte2084"}):
+            self.assertIsNone(self.tab._upscale_plan(self.cand()))
+        self.assertIn("already HDR", self.notes[-1])
+
+    def test_an_hdr_video_is_upscaled_without_hdr_being_added(self):
+        self.tab.hdr = True
+        with mock.patch.object(upscaler, "probe", return_value={"transfer": "arib-std-b67"}):
+            plan = self.tab._upscale_plan(self.cand())
+        self.assertEqual((plan["mode"], plan["hdr"]), ("fast", False))
+
+    def test_hdr_on_a_live_stream_says_why_it_is_skipped(self):
+        self.tab.upscale, self.tab.hdr = "off", True
+        self.assertIsNone(self.tab._upscale_plan(self.cand(live=True)))
+        self.assertIn("HDR", self.notes[-1])
+
+    def test_hdr_survives_a_page_seek(self):
+        self.tab.upscaled = {"mode": "burn", "duration": 100.0, "audio": True, "subs": None, "hdr": True}
+        calls = []
+        relay = SimpleNamespace(add_upscaled=lambda *a: calls.append(a) or "u", session_for=lambda u: "sess")
+        self.tab._ensure_relay = lambda host: relay
+        self.tab.app._host = "h"
+        self.tab._relay_add("https://c/x.mp4", {}, "mp4", 30.0)
+        self.assertEqual(calls[0][-1], True)
+
+    def test_a_seek_waits_for_the_new_streams_first_piece_before_the_tv_is_told(self):
+        self.tab.upscaled = {"mode": "hq", "duration": 100.0, "audio": True}
+        waited = []
+        sess = SimpleNamespace(wait_ready=lambda check, timeout: waited.append(timeout) or True)
+        relay = SimpleNamespace(add_upscaled=lambda *a: "u", session_for=lambda u: sess)
+        self.tab._ensure_relay = lambda host: relay
+        self.tab.app._host = "h"
+        self.assertEqual(self.tab._relay_add("https://c/x.mp4", {}, "mp4", 30.0), ("u", sess))
+        self.assertEqual(waited, [40.0])
+
+    def test_the_hdr_label_turns_it_on_and_remembers(self):
+        painted = []
+        self.tab.hdr, self.tab.app._save = False, lambda: painted.append(self.tab.hdr)
+        self.tab.hdr_lbl = SimpleNamespace(config=lambda **k: painted.append(k["text"]))
+        self.tab.toggle_hdr()
+        self.tab.toggle_hdr()
+        self.assertEqual(painted, ["HDR: On", True, "HDR: Off", False])
 
     def test_an_unknown_length_cant_be_laid_out_as_a_playlist(self):
         with mock.patch.object(upscaler, "probe", return_value=None):
@@ -533,7 +688,7 @@ class Tab(unittest.TestCase):
         self.tab._ensure_relay = lambda host: relay
         self.tab.app._host = "h"
         self.assertEqual(self.tab._relay_add("https://c/x.mp4", {}, "mp4", 30.0), ("u", "sess"))
-        self.assertEqual(calls, [("https://c/x.mp4", {}, "mp4", 30.0, 100.0, "hq", True, None)])
+        self.assertEqual(calls, [("https://c/x.mp4", {}, "mp4", 30.0, 100.0, "hq", True, None, False)])
         self.assertEqual(plan["session"], "sess")                     # the stall warning follows the new stream
 
     def test_what_the_label_steps_through_is_remembered(self):

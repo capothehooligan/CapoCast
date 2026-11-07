@@ -75,6 +75,7 @@ CapoCast plays everything through **Playlet**, a free and open-source YouTube cl
 | 📱 **Phone remote** | Control everything from your phone: an iPhone home-screen web app (free, no app store or signing) with the d-pad, playback, volume, typing on the TV, the Roku's apps, and your YouTube feed and Playlet settings. Scan the QR code once; it works from then on |
 | 🧭 **Phone browser** | Browse the Web tab from your phone (tap, scroll, type, address bar) and press **Cast this page**. Bookmarks and history live on your PC, a "Watching" banner follows what the PC is casting, and play/pause and a scrub bar keep the page, the TV and Discord together |
 | 🔗 **Share-menu cast** | One-time iOS Shortcut so **Cast to TV** appears in the Share menu of Safari, YouTube and most apps. YouTube links go to Playlet, other sites cast through the Web tab |
+| 🌈 **Simulated HDR for the TV** | Turn on **HDR** in the Web tab and your PC lifts the highlights and sends the TV a 10-bit HDR10 stream (needs an NVIDIA GPU and an HDR10 TV) |
 | 💬 **Subtitles on the TV** | Pick a subtitle language in the Web tab and the PC burns it into the upscaled cast (needs an NVIDIA GPU) |
 | ⏭️ **Continue Watching** | The Web tab remembers where the TV stopped in each show. A **Continue** menu on the PC and a **Continue** page in the phone's Pages sheet resume it, play the next episode, or start over |
 | 🩺 **Connection health** | A panel (the pulse icon at the top right) showing whether the TV answers, Playlet reloads, TV buffering, and, for every stall, whether this app, the browser or the link froze. **Copy report** puts it on the clipboard |
@@ -229,7 +230,17 @@ A Roku can't run shaders, so your PC does the work while you watch, and the TV p
 - **It uses more of your network:** up to 16 Mbit/s between the PC and the TV. If the TV buffers on Wi-Fi with the GPU idle, the network is the likely cause.
 - **Web tab only.** The YouTube tab plays in Playlet straight from YouTube, so it never passes through the PC.
 
-Live streams, videos already in 4K and videos of unknown length are cast as they are, and if the upscaler can't start the cast carries on without it. Either way the status line tells you.
+Live streams, videos already in 4K (or close: a widescreen film that is nearly 3840 wide gains nothing from a shader, so it isn't re-encoded) and videos of unknown length are cast as they are, and if the upscaler can't start the cast carries on without it. Either way the status line tells you.
+
+#### HDR for the TV
+
+**HDR** (next to Upscale) is off until you turn it on. It gives ordinary (SDR) video a simulated HDR picture: your PC keeps the dark and middle tones as they were, lifts the brightest highlights to about 500 nits, and sends the TV a 10-bit HDR10 stream, so the TV switches to its HDR mode. It works on its own or together with Upscale and Subtitles, and it's remembered.
+
+- **It's simulated.** The video has no real HDR information, so this stretches the highlights rather than recovering detail. Some films look better for it and some don't; turn it off if the picture looks harsh. How bright it gets depends on your TV, and the peak is `HDR_PEAK` in `upscaler.py`.
+- **It needs an NVIDIA GPU and the full FFmpeg build**, like Upscale, and your TV has to support HDR10. Every cast with HDR on goes through the PC, so it takes a few seconds longer to start, and so does each scrub.
+- **The TV may flash black** when it changes into HDR mode.
+- **Subtitles are dimmed a little** so white text isn't blindingly bright once the highlights are lifted.
+- **Real HDR videos, live streams and videos of unknown length** don't get it (the video is cast without the HDR step), and the status line says so.
 
 #### Discord status
 
