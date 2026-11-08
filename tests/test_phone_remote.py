@@ -280,7 +280,7 @@ class AppBackend(unittest.TestCase):
     def test_a_youtube_link_goes_to_playlet_and_anything_else_to_the_web_tab(self):
         with mock.patch.object(self.g.Remote, "cast") as cast:
             self.assertEqual(self.b.cast("https://youtu.be/dQw4w9WgXcQ?t=30"), "Playing on the TV")
-            cast.assert_called_once_with("10.0.0.5", "dQw4w9WgXcQ", 30, None)
+            cast.assert_called_once_with("10.0.0.5", "dQw4w9WgXcQ", 30, fresh=True)
         self.assertEqual(self.b.cast("https://site.example/ep"), "queued https://site.example/ep")
 
     def test_volume_follows_where_the_sound_is(self):

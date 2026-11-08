@@ -281,7 +281,6 @@ class Adopt(unittest.TestCase):
 
     def test_a_video_started_from_the_phone_is_not_reloaded_when_the_pc_opens_it(self):
         s = self.sync()
-        self.assertFalse(s._already_playing("h", "abc", 104))         # before: the TV's video was unknown
         s.adopt("abc", "A video")
         st = {"app": "Playlet", "state": "play", "pos": 110.0}
         with mock.patch.object(g.Remote, "state", return_value=st), \

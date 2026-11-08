@@ -674,3 +674,140 @@ class Describe(unittest.TestCase):
         tab = self.tab({})
         self.assertEqual(tab._describe("", self.cand)[0], "cdn.example")
 
+
+
+class YoutubePipeline(unittest.TestCase):
+    """The YouTube tab -> Playlet pipeline: playlists went back to the first song, and a 2600-entry queue made every
+    request to the TV slow."""
+
+    def sync(self, current="v1"):
+        with mock.patch.object(g.threading, "Thread"):
+            s = g.CastSync(lambda: "tv", SimpleNamespace(player=lambda: None), None)
+        s.current = current
+        return s
+
+    PLAYING = {"state": "play", "app": "Playlet", "pos": 40.0, "dur": 900}
+
+    # ---- what is sent to Playlet ---------------------------------------------------------------
+    def cast(self, *a, **k):
+        sent = []
+        with mock.patch.object(g.Remote, "_open", side_effect=lambda url, data=None, **kw: sent.append(
+                (kw.get("method") or ("POST" if data is not None else "GET"), url, data))):
+            g.Remote.cast("tv", *a, **k)
+        return sent
+
+    def test_a_cast_is_one_video_and_never_a_playlist(self):
+        sent = self.cast("v2", 30, fresh=True)
+        play = [s for s in sent if s[1].endswith("/api/queue/play")][0]
+        self.assertEqual(json.loads(play[2]), {"videoId": "v2", "timestamp": 30})
+
+    def test_a_new_video_starts_from_an_empty_queue(self):
+        sent = self.cast("v2", 0, fresh=True)
+        self.assertEqual([(m, u.rsplit("/api/", 1)[1]) for m, u, _ in sent], [("DELETE", "queue"), ("POST", "queue/play")])
+
+    def test_a_seek_inside_a_video_keeps_the_queue(self):
+        self.assertEqual([m for m, *_ in self.cast("v1", 90)], ["POST"])
+
+    def test_a_queue_that_cannot_be_cleared_does_not_stop_the_cast(self):
+        calls = []
+
+        def fake(url, data=None, **kw):
+            calls.append(kw.get("method") or "POST")
+            if kw.get("method") == "DELETE":
+                raise TimeoutError("slow")
+        with mock.patch.object(g.Remote, "_open", side_effect=fake):
+            g.Remote.cast("tv", "v2", 0, fresh=True)
+        self.assertEqual(calls, ["DELETE", "POST"])
+
+    def test_the_phone_casts_the_linked_video_not_its_playlist(self):
+        backend = g.PhoneBackend.__new__(g.PhoneBackend)
+        backend.app = SimpleNamespace(_host="tv")
+        with mock.patch.object(g.Remote, "cast") as cast:
+            backend.cast("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabcdefghijklmnop&t=30")
+        cast.assert_called_once_with("tv", "dQw4w9WgXcQ", 30, fresh=True)
+
+    def test_the_extension_sends_no_playlist_and_flags_a_page_that_only_just_started_following(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "extension", "feed.js"),
+                   encoding="utf-8").read()
+        self.assertNotIn("list:", src)
+        self.assertIn("castNow(v, true)", src)
+
+    # ---- clicking through songs ---------------------------------------------------------------------
+    def drain(self, s, events):
+        for e in events:
+            s.q.put(e)
+        out = []
+        while not s.q.empty():
+            out.append(s._next())
+        return out
+
+    def test_a_load_that_a_newer_load_replaces_is_skipped(self):
+        s = self.sync()
+        out = self.drain(s, [{"kind": "load", "id": "a"}, {"kind": "load", "id": "b"}, {"kind": "load", "id": "c"}])
+        self.assertEqual([e["id"] for e in out], ["c"])
+
+    def test_events_about_a_skipped_video_are_ignored_not_sent_to_the_tv(self):
+        s = self.sync(current="old")
+        events = self.drain(s, [{"kind": "load", "id": "a"}, {"kind": "pause", "id": "a"}, {"kind": "load", "id": "b"}])
+        with mock.patch.object(g.Remote, "state", return_value=self.PLAYING), \
+                mock.patch.object(g.Remote, "playlet_now", return_value={}), \
+                mock.patch.object(g.Remote, "cast") as cast, mock.patch.object(g.Remote, "key") as key, \
+                mock.patch.object(s, "_started", return_value=False):
+            for e in events:
+                s._handle(e)
+        self.assertEqual([c.args[1] for c in cast.call_args_list], ["b"])
+        key.assert_not_called()
+
+    def test_leaving_for_the_next_song_is_not_a_trip_home(self):
+        s = self.sync()
+        out = self.drain(s, [{"kind": "leave", "id": "a"}, {"kind": "load", "id": "b"}])
+        self.assertEqual([e["kind"] for e in out], ["load"])
+
+    def test_a_lone_leave_and_the_scrub_coalescing_still_work(self):
+        s = self.sync()
+        self.assertEqual([e["kind"] for e in self.drain(s, [{"kind": "leave", "id": "a"}])], ["leave"])
+        out = self.drain(s, [{"kind": "seek", "id": "a", "t": 1}, {"kind": "seek", "id": "a", "t": 2}, {"kind": "pause", "id": "a"}])
+        self.assertEqual([(e["kind"], e.get("t")) for e in out], [("seek", 2), ("pause", None)])
+
+    def test_a_seek_for_a_video_the_tv_is_not_on_is_ignored(self):
+        s = self.sync(current="v1")
+        with mock.patch.object(g.Remote, "cast") as cast, mock.patch.object(g.Remote, "key") as key:
+            s._handle({"kind": "seek", "id": "other", "t": 50})
+            s._handle({"kind": "play", "id": "other", "t": 50})
+        cast.assert_not_called()
+        key.assert_not_called()
+
+    # ---- the TV is already on it -------------------------------------------------------------------
+    def test_a_video_the_tv_moved_to_by_itself_is_not_reloaded(self):
+        s = self.sync(current="old")
+        just_started = {"state": "play", "app": "Playlet", "pos": 3.0, "dur": 200}
+        with mock.patch.object(g.Remote, "state", return_value=just_started), \
+                mock.patch.object(g.Remote, "playlet_now", return_value={"videoid": "next"}), \
+                mock.patch.object(g.Remote, "cast") as cast, mock.patch.object(s, "_align"):
+            s._handle({"kind": "load", "id": "next", "t": 2})
+        cast.assert_not_called()
+        self.assertEqual(s.current, "next")
+
+    def test_a_page_that_only_started_following_never_drags_the_tv_back(self):
+        """The page was reloaded at 7 s while the TV was at 40 s: 33 s apart, so this used to reload the TV at 7 s."""
+        for resume, reloads in ((True, False), (False, True)):
+            s = self.sync()
+            with mock.patch.object(g.Remote, "state", return_value=self.PLAYING), \
+                    mock.patch.object(g.Remote, "playlet_now", return_value={"videoid": "v1"}), \
+                    mock.patch.object(g.Remote, "cast") as cast, mock.patch.object(s, "_align"), \
+                    mock.patch.object(s, "_started", return_value=False):
+                s._handle({"kind": "load", "id": "v1", "t": 7, "resume": resume})
+            self.assertEqual(cast.called, reloads, resume)
+
+    def test_the_pc_does_not_chase_the_clock_of_a_different_video(self):
+        s = self.sync()
+        moved = []
+        s.bridge = SimpleNamespace(player=lambda: {"id": "v1", "t": 5.0, "paused": False}, send=moved.append)
+        with mock.patch.object(g.Remote, "playlet_now", return_value={"videoid": "other"}), \
+                mock.patch.object(s, "_tv_position", return_value=300.0):
+            s._align("tv")
+        self.assertEqual(moved, [])
+        with mock.patch.object(g.Remote, "playlet_now", return_value={"videoid": "v1"}), \
+                mock.patch.object(s, "_tv_position", return_value=300.0):
+            s._align("tv")
+        self.assertEqual(len(moved), 1)
