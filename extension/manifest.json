@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Playlet Cast",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Send the current YouTube video straight to Playlet on your Roku. No cast discovery, no session timeouts. Also feeds the Roku Listen app's YouTube tab.",
   "content_scripts": [
     { "matches": ["*://www.youtube.com/*"], "js": ["feed.js"], "run_at": "document_idle" }

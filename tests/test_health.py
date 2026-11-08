@@ -154,7 +154,7 @@ class Extension(unittest.TestCase):
 
     def test_the_version_was_bumped_so_a_stale_copy_is_noticeable(self):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "extension", "manifest.json")) as f:
-            self.assertEqual(json.load(f)["version"], "1.2.3")
+            self.assertEqual(json.load(f)["version"], "1.2.4")
 
 
 class CastSyncCounts(unittest.TestCase):

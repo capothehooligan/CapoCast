@@ -31,7 +31,6 @@
     return null;
   }
   const currentId = () => videoId(location.href);
-  const playlist = () => new URL(location.href).searchParams.get("list");
   const title = () => document.title.replace(/^\(\d+\)\s*/, "").replace(/\s*-\s*YouTube$/, "");
   const isAd = () => !!document.querySelector("#movie_player.ad-showing");
 
@@ -53,9 +52,13 @@
     if (!v.muted) { v.muted = true; mutedByUs = v; }
   }
 
-  function castNow(v) {
+  // No playlist is sent: Playlet ignores the video and the time when it is given one, and plays the playlist from its first
+  // song. The page moves on to the next song itself and that comes through here as a new video. `resume` says this page
+  // only just started following a video that was already playing (Auto-cast came on, the page was reloaded): if the TV
+  // is already on that video it keeps its own position and the page follows it, instead of the TV reloading.
+  function castNow(v, resume = false) {
     castId = currentId();
-    send({ kind: "load", id: castId, t: Math.floor(v.currentTime || 0), list: playlist() });
+    send({ kind: "load", id: castId, t: Math.floor(v.currentTime || 0), resume });
     mute(v);
     toast("▶  Playing on your Roku");
   }
@@ -108,7 +111,7 @@
     autocast = on;
     const v = document.querySelector("#movie_player video, #shorts-player video");
     if (on) {
-      if (v && !v.paused && currentId() && !isAd()) castNow(v);   // turned on mid-video: cast what's playing
+      if (v && !v.paused && currentId() && !isAd()) castNow(v, true);   // turned on mid-video: cast what's playing
     } else {
       castId = null;
       if (mutedByUs) { mutedByUs.muted = false; mutedByUs = null; }

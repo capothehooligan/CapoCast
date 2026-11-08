@@ -302,13 +302,30 @@ class Remote:
             raise ValueError("This app can't jump to a time. Use the skip buttons.")
 
     @classmethod
-    def cast(cls, host, video_id, timestamp=0, playlist_id=None):
-        """Play a YouTube video in Playlet (same call the Chrome extension makes)."""
+    def clear_queue(cls, host):
+        """Empty Playlet's queue (best effort). It closes the player too, so call it only right before playing something.
+
+        Playlet keeps every video it has played, and a video it plays is inserted *before* whatever was queued after
+        it. After a few hours the queue held 2600 entries: reading it took the Roku 1.6 s per request (this app reads
+        it every few seconds), and when a video ended Playlet moved on to an older song by itself."""
+        try:
+            cls._open(f"http://{host}:8888/api/queue", headers={"X-Playlet": "1"}, method="DELETE", timeout=3)
+        except OSError as e:
+            log(f"couldn't clear Playlet's queue: {e!r}")
+
+    @classmethod
+    def cast(cls, host, video_id, timestamp=0, fresh=False):
+        """Play one YouTube video in Playlet (same call the Chrome extension makes), starting `timestamp` seconds in.
+
+        Never pass a playlist: given a playlistId Playlet ignores the videoId and the timestamp and plays the playlist
+        from its first entry, after downloading all of it - the TV went back to the first song and took seconds to start.
+        The YouTube tab moves on to the next song itself, and that is cast like any other video.
+        fresh=True: this is a different video than the one playing (not a seek inside it), so start from an empty queue."""
         body = {"videoId": video_id}
-        if playlist_id:
-            body["playlistId"] = playlist_id
         if timestamp > 3:
             body["timestamp"] = int(timestamp)
+        if fresh:
+            cls.clear_queue(host)
         # Playlet answers slowly while it loads a video; a 3 s limit made a busy PC/TV report failure for a cast that
         # went through, and the retry then reloaded the video a second time.
         send = lambda: cls._open(f"http://{host}:8888/api/queue/play", data=json.dumps(body).encode(),
@@ -588,11 +605,18 @@ class CastSync:
 
     def _next(self):
         ev = self.q.get(timeout=1.0)
-        while ev.get("kind") == "seek":   # scrubbing: only the latest of several queued seeks matters
+        while ev.get("kind") in ("seek", "load", "leave"):
             with self.q.mutex:
-                if not self.q.queue or self.q.queue[0].get("kind") != "seek":
+                queued = self.q.queue
+                if ev["kind"] == "seek":          # scrubbing: only the latest of several queued seeks matters
+                    stale = bool(queued) and queued[0].get("kind") == "seek"
+                else:                             # clicking through songs: a load (or leave) a newer load will replace
+                    stale = any(e.get("kind") == "load" for e in queued)   # costs the TV a rebuffer for nothing
+                if not stale:
                     break
-                ev = self.q.queue.popleft()
+                if ev["kind"] != "seek":
+                    log(f"sync {ev['kind']} {ev.get('id')} skipped: a newer video was already asked for")
+                ev = queued.popleft()
         return ev
 
     def _run(self):
@@ -616,17 +640,22 @@ class CastSync:
     def _handle(self, ev):
         host, kind = self.host_fn(), ev.get("kind")
         log(f"sync {kind} {ev.get('id')} t={ev.get('t')}")
+        if kind in ("seek", "pause", "play") and ev.get("id") != self.current:
+            # An event about a video the TV isn't on (the page was already on the next song, or the load for it failed).
+            # Acting on it would seek or toggle whatever the TV is playing now.
+            log(f"sync {kind} skipped: {ev.get('id')} is not the video on the TV")
+            return
         if kind == "load":
-            if self._already_playing(host, ev["id"], ev.get("t", 0)):
+            if self._already_playing(host, ev["id"], ev.get("t", 0), ev.get("resume", False)):
                 log("sync load skipped: the TV is already playing this video at about this point")
                 self._count(True, f"load {ev.get('id')} at {ev.get('t', 0):.0f}s")
-                self.title = ev.get("title") or ev["id"]
+                self.current, self.title = ev["id"], ev.get("title") or ev["id"]
                 self._announce(self.title, self.current)
                 self._align(host)
                 return
             t0 = time.time()
             self._count(False, f"load {ev.get('id')} at {ev.get('t', 0):.0f}s")
-            Remote.cast(host, ev["id"], ev.get("t", 0), ev.get("list"))
+            Remote.cast(host, ev["id"], ev.get("t", 0), fresh=True)
             self.title, self.current = ev.get("title") or ev["id"], ev["id"]
             self._announce(self.title, self.current)
             self.settle_until = t0 + self.SETTLE
@@ -685,15 +714,17 @@ class CastSync:
 
     ALREADY = 12.0  # a "load" this close to where the TV already is, for the same video, is not worth a reload
 
-    def _already_playing(self, host, video_id, t):
+    def _already_playing(self, host, video_id, t, resume=False):
         """True if the TV is already playing `video_id` near `t`. Reloading it in Playlet is a 2-3 s rebuffer, so a
-        repeated "load" (the page re-announcing a video that is already on the TV) must not cost one."""
-        if video_id != self.current:
-            return False
+        repeated "load" (the page re-announcing a video that is already on the TV) must not cost one.
+
+        Playlet is asked what it plays, not CastSync's memory of it: the TV can be ahead (it moved on to the next song
+        itself, or the phone started it). resume: the page only just started following (it was reloaded, or Auto-cast
+        came on mid-video), so wherever its clock is, the TV is the one to trust and it is not worth a jump."""
         st = Remote.state(host)
         if not st or st["app"] != "Playlet" or st["state"] not in ("play", "pause", "buffer"):
             return False
-        if abs(st["pos"] - t) > self.ALREADY:
+        if not resume and abs(st["pos"] - t) > self.ALREADY:
             return False
         return Remote.playlet_now(host).get("videoid") == video_id
 
@@ -743,6 +774,11 @@ class CastSync:
             self._retry = 0
         if tv is None or not p or p["id"] != self.current or p["paused"]:
             return
+        if Remote.playlet_now(host).get("videoid") != self.current:
+            # The TV is on a different video (it picked the next one, or someone used the remote). Its clock says nothing
+            # about this one: following it jumped the PC to a random point, and the page's seek then reloaded the TV.
+            log("align skipped: the TV is not playing the video the PC is on")
+            return
         drift = tv - p["t"]
         if abs(drift) > self.DRIFT:
             self._move_pc(tv + self.APPLY)
@@ -786,7 +822,7 @@ class CastSync:
             target = pc["t"] + (0 if pc["paused"] else self.lead)
             t0 = time.time()
             self._count(False, f"resync recast {pc['id']} at {target:.0f}s")
-            Remote.cast(host, pc["id"], target)
+            Remote.cast(host, pc["id"], target, fresh=True)
             self.current, self.title = pc["id"], self.title if pc["id"] == self.current else pc["id"]
             self._announce(self.title, self.current)
             self.settle_until = t0 + self.SETTLE
@@ -1629,8 +1665,8 @@ class PhoneBackend:
     def cast(self, url):
         yt = phone_remote.youtube_target(url)
         if yt:
-            vid, playlist, start = yt
-            Remote.cast(self.app._host, vid, start, playlist)
+            vid, _playlist, start = yt        # the link's video, not its playlist (Playlet would play the playlist's first)
+            Remote.cast(self.app._host, vid, start, fresh=True)
             return "Playing on the TV"
         return self.app.web.cast_link(url)
 
