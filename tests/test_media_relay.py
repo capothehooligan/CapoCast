@@ -60,6 +60,12 @@ class Site(BaseHTTPRequestHandler):
             self.send_response(404)
             self.send_header("Content-Length", "0")
             return self.end_headers()
+        rng = self.headers.get("Range")
+        if rng and path.endswith(".m3u8"):           # like the real CDN behind strm.cx: it honours ranges on playlists
+            a, _, b = rng.replace("bytes=", "").partition("-")
+            a, b = int(a), min(int(b) if b else len(body) - 1, len(body) - 1)
+            extra["Content-Range"] = f"bytes {a}-{b}/{len(body)}"
+            body, status = body[a:b + 1], 206
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -103,6 +109,23 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(resp.read(), SEG)
         self.assertEqual(resp.headers["Content-Type"], "video/mp2t")
         self.assertEqual(self.get(self.relay.base + key.split('URI="')[1].rstrip('"')).read(), b"k" * 16)
+
+    def test_a_range_request_for_a_playlist_gets_the_whole_playlist(self):
+        # The Roku's reader can ask for part of a playlist. Passing that on to a site that honours it gave the TV a
+        # fragment of the master, which it refused: "reader pick stream error:bad:invalid or corrupt playlist".
+        url = self.relay.add(self.origin + "/master.m3u8", {"Referer": REFERER}, "hls")
+        resp = self.get(url, {"Range": "bytes=0-20"})
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.headers.get("Content-Range"))
+        master = resp.read().decode()
+        variant = [l for l in master.splitlines() if l and not l.startswith("#")][0]
+        self.assertIn("RESOLUTION=1280x720", master)
+        media = self.get(self.relay.base + variant, {"Range": "bytes=0-30"}).read().decode()
+        self.assertIn("#EXT-X-ENDLIST", media)
+        self.assertEqual(sum(1 for l in media.splitlines() if l.startswith("/s/") and l.endswith(".ts")), 3)
+        self.assertNotIn("Range", Site.seen[-1])               # the site was asked for all of it
+        seg = [l for l in media.splitlines() if l.startswith("/s/") and l.endswith(".ts")][0]
+        self.assertEqual(self.get(self.relay.base + seg, {"Range": "bytes=0-"}).read(), SEG)
 
     def test_mp4_supports_range(self):
         url = self.relay.add(self.origin + "/movie.mp4", {"Referer": REFERER}, "mp4")

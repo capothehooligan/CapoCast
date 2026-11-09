@@ -26,6 +26,7 @@ from discord_presence import looks_like_logo
 from media_relay import replay_headers
 from stream_finder import SNIFF_MIMES, Candidate, classify, host_of, is_ad_url, site_of, sniff
 
+LOST = "Lost contact with the browser"   # guard.error when the DevTools link dropped while Brave may still be running
 GESTURE_WINDOW = 1.5     # seconds a real click/keypress "covers" a navigation that follows it
 POPUP_GESTURE = 3.0
 MAX_CANDIDATES = 40
@@ -51,7 +52,8 @@ PAGE_JS = r"""
       const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
       const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
       out.push({src: v.currentSrc || v.src || '', dur: isFinite(v.duration) ? v.duration : 0,
-                playing: !v.paused && !v.ended && v.readyState > 2, area: Math.round(w * h), t: v.currentTime,
+                playing: !v.paused && !v.ended && v.readyState > 2, paused: v.paused, area: Math.round(w * h),
+                t: v.currentTime,
                 muted: v.muted, poster: v.poster || '',
                 tracks: [...v.querySelectorAll('track')].filter(t => t.src).map(t => ({
                   src: t.src, label: t.label || '', lang: t.srclang || '', kind: t.kind || 'subtitles', def: t.default}))});
@@ -182,7 +184,12 @@ PAGE_JS = r"""
     }
     else if (m.__rl === 'seek') {
       for (const v of vids()) {
-        if (!m.dur || Math.abs(v.duration - m.dur) < 3) { ignoreUntil = Date.now() + 1500; try { v.currentTime = m.t; } catch (x) {} }
+        if (!m.dur || Math.abs(v.duration - m.dur) < 3) {
+          ignoreUntil = Date.now() + 1500;                 // our own move: its seek / pause / play events aren't you
+          try { v.currentTime = m.t; } catch (x) {}
+          if (m.paused === true) { try { v.pause(); } catch (x) {} }        // held while the TV buffers
+          else if (m.paused === false) { v.play().catch(() => {}); }
+        }
       }
     }
     for (let i = 0; i < frames.length; i++) { try { frames[i].postMessage(m, '*'); } catch (x) {} }
@@ -258,6 +265,7 @@ class WebGuard:
         self._callbacks = {}
         self.running = False
         self.error = ""
+        self.attached_at = 0.0
         # session bookkeeping (reader thread only)
         self._baseline, self._ready = set(), False
         self._sessions = {}              # sessionId -> {"type", "targetId"}
@@ -295,9 +303,11 @@ class WebGuard:
         with open(port_file) as f:
             port = f.read().split()[0]
         ver = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5))
-        self.ws = connect(ver["webSocketDebuggerUrl"], max_size=None, open_timeout=5)
+        # No keepalive pings: this is a loopback socket, which can't go silently dead, and on a PC busy with a game and a
+        # 4K encode a late pong would close a perfectly good connection.
+        self.ws = connect(ver["webSocketDebuggerUrl"], max_size=None, open_timeout=5, ping_interval=None)
         self._stop.clear()
-        self.running, self.error = True, ""
+        self.running, self.error, self.attached_at = True, "", time.time()
         self._thread = threading.Thread(target=self._run, name="web-guard", daemon=True)
         self._thread.start()
 
@@ -410,9 +420,13 @@ class WebGuard:
         """Jump the page's video forward or back by dt seconds, as scrubbing it would."""
         self.post_page({"__rl": "skip", "dt": float(dt), "dur": float(dur or 0)})
 
-    def seek_page(self, t, dur):
-        """Move the page's copy of the video (the one that's `dur` seconds long) to t, without it counting as input."""
-        self.post_page({"__rl": "seek", "t": float(t), "dur": float(dur or 0)})
+    def seek_page(self, t, dur, paused=None):
+        """Move the page's copy of the video (the one that's `dur` seconds long) to t, without it counting as input.
+        paused=True also pauses it there (held while the TV buffers), False also plays it."""
+        msg = {"__rl": "seek", "t": float(t), "dur": float(dur or 0)}
+        if paused is not None:
+            msg["paused"] = bool(paused)
+        self.post_page(msg)
 
     def video_time(self, dur=0):
         """Where the page's video is now (seconds), or None. dur picks the right one when a page has several."""
@@ -521,6 +535,19 @@ class WebGuard:
         found = self.page_images(timeout, dur)
         return found[0] if found else ""
 
+    def video_paused(self, dur=0):
+        """Whether the page's video (the one `dur` seconds long) is paused: stopped on purpose, which a stall is not.
+        None if it isn't there, or the page didn't say."""
+        now = time.time()
+        with self._lock:
+            for e in self._videos.values():
+                if now - e["at"] > 6:
+                    continue
+                for v in e["items"]:
+                    if v.get("dur") and (not dur or abs(v["dur"] - dur) < 3):
+                        return bool(v["paused"]) if "paused" in v else None
+        return None
+
     def video_playing(self, dur=0):
         now = time.time()
         with self._lock:
@@ -608,7 +635,7 @@ class WebGuard:
         except Exception as e:
             if not self._stop.is_set():
                 self.log(f"web guard stopped: {e!r}")
-                self.error = "Lost contact with the browser"
+                self.error = LOST
         finally:
             self.running = False
 

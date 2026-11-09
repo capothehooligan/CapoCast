@@ -100,8 +100,11 @@ class WebTab:
     cast_end = None                                           # when the video will end by Discord's clock, if its length is known
     subs, sub_dir = "", None                                  # subtitle language chosen ('' = off); folder for fetched files
     cast_site = ""                                           # the site being cast from, for the Discord status
+    _reattach_at, _reattach_tries = 0.0, 0                    # reconnecting to the browser after its DevTools link dropped
 
     SOURCE = "web"                                        # this tab's name in the shared Discord status
+    REATTACH_MAX = 60.0                                   # longest wait between reconnect attempts, seconds
+    STEADY = 30.0                                         # a link that has held this long resets the reconnect back-off
 
     def __init__(self, app, page, ui, home=None, upscale=None, discord=None, subs="", hdr=False):
         self.app, self.page, self.ui = app, page, ui
@@ -245,6 +248,38 @@ class WebTab:
             self.ui.log(f"web launch failed: {e!r}")
             self._message(f"{e}  ·  click to retry", clickable=True)
 
+    def _reattach(self):
+        """Reconnect to the still-running browser after the DevTools link dropped, instead of leaving the tab frozen with
+        protection off until the app is restarted (what happened after the PC slept on 2026-11-08). A fresh guard is
+        built because the old one's sessions died with the link; the page, its streams and a cast in progress carry on."""
+        old = self.guard
+        self._reattach_tries += 1
+        self._reattach_at = time.time() + min(self.REATTACH_MAX, 2.0 * 2 ** min(self._reattach_tries, 5))
+        pf = brave_profile.port_file(self.profile)
+        if not os.path.exists(pf):
+            return
+        new = WebGuard(self.ui.log, home=self.home)
+        new.on_youtube = self._youtube_tapped
+        if old._view:
+            new.set_view(*old._view)
+        with old._lock:                               # what the old guard knew about this page is still true
+            new._cands, new._url, new._title, new._page_key = dict(old._cands), old._url, old._title, old._page_key
+        try:
+            new.attach(pf)
+        except Exception as e:
+            self.ui.log(f"web guard reconnect failed (try {self._reattach_tries}): {e!r}")
+            return
+        old.stop()
+        self.guard = new
+        if self.sync is not None:
+            self.sync.guard = new
+            self.sync.epoch0 = new.epoch              # the same page seen by a new guard, not "you left the page"
+        self.ui.log(f"web guard reconnected to the browser (try {self._reattach_tries})")
+
+    def on_resume(self):
+        """The PC just woke up: check the browser link now rather than at the next back-off step."""
+        self._reattach_at = 0.0
+
     def _tick(self):
         try:
             if self.proc is not None and self.proc.poll() is not None:
@@ -265,6 +300,10 @@ class WebTab:
                     elif time.time() - self.launched_at > 40:
                         self._message("Couldn't open the Web tab  ·  click to retry", clickable=True)
                         self.proc.terminate()
+                elif not self.guard.running and time.time() >= self._reattach_at:
+                    self._reattach()       # the link dropped (the PC slept, say) but Brave is still up: reconnect
+                elif self.guard.running and time.time() - self.guard.attached_at > self.STEADY:
+                    self._reattach_tries = 0
                 if self.view.has_frame and self.msg.cget("text"):
                     self._message("")
                 self._watch_next()
