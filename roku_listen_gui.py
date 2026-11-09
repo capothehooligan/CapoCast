@@ -39,6 +39,7 @@ import phone_store
 import roku_find
 import tv_apps
 import web_tab
+from tv_clock import TvClock
 import yt_embed
 from types import SimpleNamespace
 from yt_bridge import Bridge
@@ -52,15 +53,51 @@ CONFIG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RokuL
 CHUNK = 960 * 4  # 20 ms of 48 kHz stereo s16le
 RR_EVERY = 1.0   # seconds between RTCP receiver reports; the Roku drops the stream if they're too sparse
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-LOG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RokuListen.log")
+DEFAULT_LOG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RokuListen.log")
+LOG = os.environ.get("CAPOCAST_LOG") or DEFAULT_LOG
+TEST_LOG = os.path.join(tempfile.gettempdir(), "RokuListen.test.log")
+LOG_MAX = 4_000_000     # bytes: past this the log moves to RokuListen.log.1 (one old copy is kept) and starts again
 PHONE_STORE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RokuListen.phone.json")   # bookmarks, history
 PLAYLET_ID = tv_apps.PLAYLET_ID   # the Roku channel id of Playlet, which plays the YouTube tab's videos
+_log_lock = threading.Lock()
+_log_days = {}          # log file -> the date last written to it
+_log_writes = [0]
+
+
+def log_path():
+    """Where log lines go. A test run from source (unittest or pytest loaded) never writes into the user's real log: its
+    fake videos and fake audio devices read like real faults there, and once made ~2,700 bogus 'no driver' errors. A path
+    set on purpose (a test patching LOG, or the CAPOCAST_LOG environment variable) always wins."""
+    if LOG != DEFAULT_LOG or getattr(sys, "frozen", False):
+        return LOG
+    if "unittest" in sys.modules or "pytest" in sys.modules:
+        return TEST_LOG
+    return LOG
 
 
 def log(msg):
+    path = log_path()
     try:
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}" + chr(10))
+        with _log_lock:
+            _rotate_log(path)
+            with open(path, "a", encoding="utf-8") as f:
+                day = time.strftime("%Y-%m-%d")
+                if _log_days.get(path) != day:      # lines only carry the time, so mark each new day (and each start)
+                    _log_days[path] = day
+                    f.write(f"===== {time.strftime('%A %Y-%m-%d')} =====" + chr(10))
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}" + chr(10))
+    except OSError:
+        pass
+
+
+def _rotate_log(path):
+    _log_writes[0] += 1
+    if _log_writes[0] % 200 != 1:                   # a size check per line would cost a stat call per line
+        return
+    try:
+        if os.path.getsize(path) > LOG_MAX:
+            os.replace(path, path + ".1")
+            _log_days.pop(path, None)               # the fresh file opens with a date line
     except OSError:
         pass
 
@@ -70,30 +107,137 @@ SOUND_DELAY_MAX = 1500  # the Sound delay slider's top end, ms
 BUFFER_MS = 300         # sound held back before playing: the TV's Wi-Fi pauses for up to about 250 ms every 10 s
 MAX_FILL = 100          # a longer gap (a second of 10 ms packets) is an outage, not something to paper over
 DEVICE_RETRY = 30.0     # seconds to keep trying to reopen a lost audio output before giving up
+DEVICE_WAIT = 15.0      # seconds to wait for the chosen output to appear (SteelSeries Sonar starting) before using the default
+MME_NAME = 31           # Windows' oldest audio API cuts device names to this many characters
+ALIASES = ("Primary Sound Driver", "Microsoft Sound Mapper - Output")   # other names for "System default"
+
+# PortAudio keeps the device list it made when it started, and re-making it (to see a device that appeared since) must not
+# happen while another thread is asking it about devices.
+SD_LOCK = threading.RLock()
+
+
+def _api_names():
+    try:
+        return [h["name"] for h in sd.query_hostapis()]
+    except Exception:
+        return []
 
 
 def output_devices():
-    """Names of the sound outputs, de-duplicated (Windows lists each device once per audio API)."""
-    try:
-        seen = []
-        for d in sd.query_devices():
-            if d["max_output_channels"] > 0 and d["name"] not in seen:
-                seen.append(d["name"])
-        return seen
-    except Exception:
+    """Names of the sound outputs for the menu, each once. Windows lists every device once per audio API; the oldest API
+    cuts names to 31 characters and the kernel-streaming one uses its own, so those copies are left out when the full
+    name is there (and kernel streaming always: it can't convert, so opening it fails)."""
+    with SD_LOCK:
+        try:
+            devices, apis = sd.query_devices(), _api_names()
+        except Exception:
+            return []
+    full, short = [], []
+    for d in devices:
+        if d["max_output_channels"] <= 0:
+            continue
+        api = apis[d["hostapi"]] if d["hostapi"] < len(apis) else ""
+        if "WDM-KS" in api or d["name"] in ALIASES:
+            continue
+        (short if api == "MME" else full).append(d["name"])
+    seen = []
+    for n in full + short:
+        if n in seen or (len(n) == MME_NAME and any(f.startswith(n) for f in full)):
+            continue
+        seen.append(n)
+    return seen
+
+
+def output_choices(name):
+    """sounddevice indices to try for the output called `name`, the most dependable copy first: DirectSound, then the
+    oldest API (MME, whose name is cut to 31 characters), then WASAPI; never kernel streaming. [None] for the system
+    default; [] when the device isn't there."""
+    if not name:
+        return [None]
+    first = find_output_device(name)
+    if first is None:
         return []
+    with SD_LOCK:
+        try:
+            devices, apis = sd.query_devices(), _api_names()
+        except Exception:
+            return [first]
+    rank = {"Windows DirectSound": 0, "MME": 1, "Windows WASAPI": 2}
+    found = []
+    for i, d in enumerate(devices):
+        api = apis[d["hostapi"]] if d["hostapi"] < len(apis) else ""
+        if d["max_output_channels"] <= 0 or api not in rank:
+            continue
+        cut = len(d["name"]) == MME_NAME and name.startswith(d["name"])          # its copy with the name cut short
+        if d["name"] == name or (api == "MME" and cut) or (len(name) == MME_NAME and d["name"].startswith(name)):
+            found.append((rank[api], i))
+    return [first] + [i for _, i in sorted(found) if i != first]
 
 
 def find_output_device(name):
     """sounddevice index of the output called `name`, or None (system default) if unset or not present."""
     if not name:
         return None
+    with SD_LOCK:
+        try:
+            devices, apis = sd.query_devices(), _api_names()
+            # Never kernel streaming: it can't convert the format (opening fails) and it takes the device for itself.
+            out = [(i, d) for i, d in enumerate(devices) if d["max_output_channels"] > 0
+                   and not (d["hostapi"] < len(apis) and "WDM-KS" in apis[d["hostapi"]])]
+            match = [i for i, d in out if d["name"] == name]
+            if not match:                        # a name saved from the oldest API, or one it cuts short
+                match = [i for i, d in out if len(d["name"]) == MME_NAME and name.startswith(d["name"])]
+            ds = [i for i in match if devices[i]["hostapi"] < len(apis) and apis[devices[i]["hostapi"]] == "Windows DirectSound"]
+            default = sd.default.hostapi
+            return next((i for i in ds), next((i for i in match if devices[i]["hostapi"] == default),
+                                              match[0] if match else None))
+        except Exception:
+            return None
+
+
+def default_output_name():
+    """What the system default output is called right now (after a rescan), shortened for the status line."""
+    with SD_LOCK:
+        try:
+            return short_device_name(sd.query_devices(sd.default.device[1])["name"])
+        except Exception:
+            return "the default output"
+
+
+def short_device_name(name):
+    """'SteelSeries Sonar - Media (SteelSeries Sonar Virtual Audio Device)' -> 'SteelSeries Sonar - Media'."""
+    base = name.split(" (")[0].strip() if " (" in name else name.strip()
+    return base or name
+
+
+class _WaveOutCaps(ctypes.Structure):
+    _fields_ = [("wMid", ctypes.c_ushort), ("wPid", ctypes.c_ushort), ("vDriverVersion", ctypes.c_uint),
+                ("szPname", ctypes.c_wchar * 32), ("dwFormats", ctypes.c_uint), ("wChannels", ctypes.c_ushort),
+                ("wReserved1", ctypes.c_ushort), ("dwSupport", ctypes.c_uint)]
+
+
+def live_output_names():
+    """The sound outputs Windows has right now, asked directly (names cut to 31 characters), so a device that appeared
+    after PortAudio made its list is seen without re-making it (which can't be done while a stream is open).
+    None if Windows can't be asked."""
     try:
-        default = sd.default.hostapi
-        match = [i for i, d in enumerate(sd.query_devices()) if d["max_output_channels"] > 0 and d["name"] == name]
-        return next((i for i in match if sd.query_devices(i)["hostapi"] == default), match[0] if match else None)
+        winmm = ctypes.windll.winmm
+        names = []
+        for i in range(winmm.waveOutGetNumDevs()):
+            caps = _WaveOutCaps()
+            if winmm.waveOutGetDevCapsW(i, ctypes.byref(caps), ctypes.sizeof(caps)) == 0:
+                names.append(caps.szPname)
+        return names
     except Exception:
         return None
+
+
+def device_is_live(name):
+    """Whether Windows has the output called `name` right now (None if it can't tell)."""
+    names = live_output_names()
+    if names is None or not name:
+        return None
+    return any(n == name or (len(n) == MME_NAME and name.startswith(n)) or n == name[:MME_NAME] for n in names)
 
 
 def filler_packets(prev, packet):
@@ -134,7 +278,10 @@ def has_libopus(ffmpeg):
 def decoder_command(ffmpeg, sdp_path, codec="libopus"):
     """FFmpeg reading the Roku's RTP from `sdp_path` and writing raw PCM to stdout. `codec` picks the Opus decoder:
     only libopus conceals lost frames, FFmpeg's own decoder doesn't."""
+    # -listen_timeout -1: by default FFmpeg gives up on an RTP stream after 10 s without a packet (the TV going quiet
+    # on its home screen, a Wi-Fi drop) and the session ended with "Audio decoder stopped"; now it waits for more.
     return [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning", "-protocol_whitelist", "file,udp,rtp",
+            "-listen_timeout", "-1",
             "-fflags", "nobuffer", "-flags", "low_delay"] + (["-c:a", codec] if codec else []) +            ["-i", sdp_path, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]
 
 
@@ -580,9 +727,40 @@ class CastSync:
             self.health.reload(skipped, detail)
 
     SETTLE = 3.0    # after a (re)load Playlet still reports the previous stream's state for a moment
-    DRIFT = 0.6     # seconds of PC-vs-TV difference worth correcting
-    RECHECK = 20.0  # seconds between drift checks while both are playing
+    DRIFT = 0.4     # seconds of PC-vs-TV difference worth correcting (the clock knows the TV to ~0.05 s)
+    LIMIT = 1.5     # the promise: the PC and the TV are never this far apart for longer than a check or two
+    WATCH = 0.5     # seconds between looks at the TV while a video is on (one ~26 ms request)
+    CHECK = 2.0     # seconds between precise drift measurements while both play
+    BIG = 15.0      # a drift this large is checked twice before the PC moves: a reading taken mid-switch lies
+    MISMATCH = 0.5  # seconds the TV may be paused while the PC plays (or the other way) before the PC follows the TV
+    MAX_MOVES = 6   # corrections per minute; beyond this the PC can't keep up, so checks slow down instead of fighting it
+    RECHECK = 20.0  # seconds between checks when corrections keep failing to hold
     APPLY = 0.3     # a nudge reaches the page on its next poll (every 250 ms)
+    PC_GRACE = 1.0  # seconds a pause / play made on the PC may take to reach the TV before the app passes it on itself
+    SHARP = 0.2     # the TV's position is known to within this (seconds) without taking quick readings
+
+    # drift-watch state; class-level so a CastSync built without __init__ (tests) still has it
+    _watch_at = _check_at = 0.0
+    _holding = False             # the PC is paused because the TV is buffering
+    _mismatch_since = None       # when the TV and the PC started disagreeing about pause / play
+    _moves = ()                  # times of recent corrections
+    _pc_seen = None              # (paused, when the PC was first seen that way; 0 = not its own change)
+    _pc_mine_until = 0.0         # the PC's pause / play changes until then are the app's own moves
+
+    @property
+    def clock(self):
+        """Where the TV really is, from its readings (see tv_clock)."""
+        c = self.__dict__.get("_clock")
+        if c is None:
+            c = self.__dict__["_clock"] = TvClock()
+        return c
+
+    def _read(self, host):
+        """Remote.state, with every Playlet reading also teaching the clock."""
+        st = Remote.state(host)
+        if st and st.get("app") == "Playlet":
+            self.clock.feed(st["state"], st["pos"], time.time())
+        return st
 
     def __init__(self, host_fn, bridge, on_now=None):
         self.host_fn, self.bridge = host_fn, bridge
@@ -603,8 +781,19 @@ class CastSync:
     def push(self, event):
         self.q.put(event)
 
+    FAST = 0.25      # seconds between looks while the TV is stopped: how soon it starts again decides how far apart
+    FAST_FOR = 60.0  # ...for this long into a stop; a long pause goes back to WATCH
+
+    def _wait(self):
+        """How long the sync thread may sleep between looks at the TV."""
+        c = self.clock
+        stopped = c.last is not None and c.last[0] in ("pause", "buffer") and c.since is not None
+        if self._holding or (stopped and time.time() - c.since < self.FAST_FOR):
+            return self.FAST
+        return self.WATCH
+
     def _next(self):
-        ev = self.q.get(timeout=1.0)
+        ev = self.q.get(timeout=self._wait())  # idle wake-ups drive the drift watch (WATCH)
         while ev.get("kind") in ("seek", "load", "leave"):
             with self.q.mutex:
                 queued = self.q.queue
@@ -624,10 +813,106 @@ class CastSync:
             try:
                 ev = self._next()
             except queue.Empty:
-                if self.current and time.time() - self.last_check > self.RECHECK:
-                    self._safe("align", lambda: self._align(self.host_fn()))
+                if self.current:
+                    self._safe("watch", lambda: self._watch(self.host_fn()))
                 continue
             self._safe(ev.get("kind"), lambda: self._handle(ev))
+
+    def _watch(self, host):
+        """Keep the PC within LIMIT seconds of the TV between events: look at the TV every WATCH seconds, hold the PC
+        while the TV buffers (the gap can't be corrected while the TV stands still, only kept from growing), follow the
+        TV's pause / play when it changes on its own (Roku remote, phone), and measure the drift precisely every CHECK.
+
+        Used to be one measurement every 20 s that gave up whenever the TV wasn't cleanly playing: the log showed 265 of
+        299 corrections finding the screens already more than 1.5 s apart, most often the TV 2-4 s behind after
+        buffering. Positions come from the clock, not the raw reading, which can lag a whole step: parking the PC on a
+        step-old reading and letting it go from another left it up to 1.7 s behind in the simulation. The TV is never
+        moved here to fix the sync: it is the real screen, and moving it costs a rebuffer."""
+        now = time.time()
+        if now < self._watch_at or now < self.settle_until:
+            return
+        self._watch_at = now + self._wait() - 0.01
+        st = self._read(host)
+        if not st or st["app"] != "Playlet":
+            self._holding, self._mismatch_since = False, None
+            return
+        p = self.bridge.player()
+        if not p or p["id"] != self.current or p.get("ad"):
+            self._mismatch_since = None
+            return
+        now = time.time()
+        pc_paused = bool(p["paused"])
+        if self._pc_seen is None:
+            self._pc_seen = (pc_paused, 0.0)
+        elif self._pc_seen[0] != pc_paused and now >= self._pc_mine_until:
+            self._pc_seen = (pc_paused, now)                       # the PC paused or played by itself (you, on the PC)
+        tv_state, tv = st["state"], self.clock.now(now)
+        if tv_state == "buffer":                                   # the TV stalled: stop the PC where the TV stands
+            if not pc_paused and not self._holding and self._same_video(host, tv, p):
+                self._holding = True
+                self._move_pc(tv, paused=True)
+                log(f"held the PC at {tv:.1f}s while the TV buffers")
+            return
+        if self._holding:                                          # the TV moves again: let the PC go from there
+            self._holding = False
+            if tv_state == "play" and self._same_video(host, tv, p):
+                self._move_pc(tv + self.APPLY, paused=False)
+                log("let the PC go: the TV is playing again")
+                self._check_at = time.time() + 1.5
+            return
+        if tv_state in ("play", "pause") and (tv_state == "pause") != pc_paused:
+            self._disagree(host, tv_state, tv, p, now, st.get("dur") or 0)
+            return
+        self._mismatch_since = None
+        if tv_state != "play" or pc_paused:
+            return
+        # Clearly apart already (the PC stalled, SponsorBlock skipped on the TV): measure now, not at the next check.
+        # The clock gives the earliest and latest the TV can be; only a gap beyond both counts as proven.
+        lo, hi = self.clock.bounds(now)
+        apart = max(lo - p["t"], p["t"] - (hi if hi is not None else lo + 1.0))
+        if apart > self.DRIFT and now - self.last_check >= 1.0:
+            self._check_at = now
+        if now >= self._check_at:
+            self._check_at = now + self.CHECK
+            self._align(host)
+
+    def _disagree(self, host, tv_state, tv, p, now, dur=0):
+        """The TV and the PC disagree about playing. Whichever changed last says what happened. The TV's own pause or
+        play (Roku remote, phone, the end of a video) is followed at once: waiting to be sure used to let the two run
+        1.7 s apart. One made on the PC is on its way to the TV as an event; if it got lost (the page drops its own
+        pause / play for 3 s after the app moves it), the app passes it on itself."""
+        if self._mismatch_since is None:
+            self._mismatch_since = now
+        waited = now - self._mismatch_since
+        tv_at = self.clock.since if self.clock.before is not None else 0.0
+        pc_at = self._pc_seen[1]
+        if tv_at > pc_at or (tv_at == pc_at and waited >= self.MISMATCH):
+            paused = tv_state == "pause"
+            if not self._same_video(host, tv, p):
+                self._mismatch_since = None
+                return
+            self._mismatch_since = None
+            self._move_pc(tv + (0 if paused else self.APPLY), paused=paused)
+            log(f"PC {'paused' if paused else 'resumed'} to match the TV")
+            if not paused:
+                self._check_at = time.time() + 1.5
+        elif pc_at > tv_at and waited >= self.PC_GRACE and self.q.empty() and not (dur and tv > dur - 3):
+            # (Not in the last seconds: there the PC "pausing" is its copy reaching the end a moment before the TV.)
+            self._mismatch_since = None
+            want = "pause" if p["paused"] else "play"
+            log(f"the TV missed the PC's {want}: passing it on")
+            self._ensure(host, want)
+            self._pc_seen = (bool(p["paused"]), 0.0)
+
+    def _same_video(self, host, tv, p):
+        """A move this far is checked against what Playlet plays first: the TV may be on another video (it moved on by
+        itself, or someone used the remote) and its clock says nothing about this one."""
+        if tv is None:
+            return False
+        if abs(tv - p["t"]) <= self.BIG or Remote.playlet_now(host).get("videoid") == self.current:
+            return True
+        log("left the PC where it is: the TV is not playing the video the PC is on")
+        return False
 
     def _safe(self, what, fn):
         try:
@@ -656,6 +941,7 @@ class CastSync:
             t0 = time.time()
             self._count(False, f"load {ev.get('id')} at {ev.get('t', 0):.0f}s")
             Remote.cast(host, ev["id"], ev.get("t", 0), fresh=True)
+            self.clock.reset()                    # the TV starts over: where it was says nothing now
             self.title, self.current = ev.get("title") or ev["id"], ev["id"]
             self._announce(self.title, self.current)
             self.settle_until = t0 + self.SETTLE
@@ -685,6 +971,7 @@ class CastSync:
             t0 = time.time()
             self._count(False, f"seek {ev.get('id')} to {target:.0f}s")
             Remote.cast(host, ev["id"], target)   # Playlet seeks by replaying at a timestamp
+            self.clock.reset()
             self.settle_until = t0 + self.SETTLE
             if paused:
                 self._ensure(host, "pause")
@@ -696,6 +983,7 @@ class CastSync:
                 self._align(host)
         elif kind == "leave":
             Remote.close_player(host)   # Playlet closes its player and shows its home screen
+            self.clock.reset()
             self.title, self.current = "", None
             self._announce(None, None)
 
@@ -721,7 +1009,7 @@ class CastSync:
         Playlet is asked what it plays, not CastSync's memory of it: the TV can be ahead (it moved on to the next song
         itself, or the phone started it). resume: the page only just started following (it was reloaded, or Auto-cast
         came on mid-video), so wherever its clock is, the TV is the one to trust and it is not worth a jump."""
-        st = Remote.state(host)
+        st = self._read(host)
         if not st or st["app"] != "Playlet" or st["state"] not in ("play", "pause", "buffer"):
             return False
         if not resume and abs(st["pos"] - t) > self.ALREADY:
@@ -732,7 +1020,7 @@ class CastSync:
         """Wait (abandoning it if a newer event arrives) until the TV is really playing near target; learn the lead."""
         last = None
         while time.time() < t0 + 10 and self.q.empty():
-            st = Remote.state(host)
+            st = self._read(host)
             if st and st["state"] == "play" and abs(st["pos"] - target) < 6:
                 if last is not None and st["pos"] > last:      # the position is moving: it's actually playing
                     took = time.time() - t0 - 0.1                # ~half a poll interval of detection delay
@@ -743,46 +1031,77 @@ class CastSync:
             time.sleep(0.2)
         return False
 
-    def _tv_position(self, host):
-        """The TV's position right now. Roku updates it in steps, so wait for a step and extrapolate from it."""
-        first = Remote.state(host)
-        if not first or first["state"] != "play":
+    def _tv_position(self, host, near=None):
+        """The TV's position right now, or None if it isn't playing. The clock usually knows it already; when it is
+        unsure (just after a jump, or before it has learned how this TV reports), quick readings until the TV's next
+        step pin it down. Not when it is more than BIG from `near` (the PC): that is confirmed by watching instead."""
+        first = self._read(host)
+        if not first or first["state"] != "play" or first.get("app") != "Playlet":
             return None
         start = time.time()
-        while time.time() - start < 1.5:
+        while self.clock.width() > self.SHARP and time.time() - start < 1.5:
+            if near is not None and abs(self.clock.now(time.time()) - near) > self.BIG:
+                break
             time.sleep(0.05)
-            st = Remote.state(host)
-            if not st or st["state"] != "play":
+            st = self._read(host)
+            if not st or st["state"] != "play" or st.get("app") != "Playlet":
                 return None
-            if st["pos"] != first["pos"]:
-                return st["pos"]          # fresh reading, taken just now
-        return first["pos"] + (time.time() - start)
+        return self.clock.now(time.time())
+
+    def _jump_holds(self, host, seconds=1.2):
+        """After a big jump, watch the TV for a moment. A real one (SponsorBlock skipping a segment, the Roku remote)
+        stays on its new timeline and moves along it; a reading taken mid-switch is gone a moment later, or stands
+        still. (Two looks a second apart weren't enough: a lie that lasts two readings passed.)"""
+        origin, end = self.clock.origin, time.time() + seconds
+        while time.time() < end:
+            time.sleep(0.1)
+            st = self._read(host)
+            if not st or st["state"] != "play" or st.get("app") != "Playlet" or self.clock.origin != origin:
+                return False
+        return self.clock.moves > 0
 
     def _align(self, host):
         """Snap the muted PC player onto the TV's timeline if they've drifted apart."""
         self.last_check = time.time()
         p = self.bridge.player()
+        if not p or p["id"] != self.current or p["paused"] or p.get("ad"):
+            return
+        tv = self._tv_position(host, near=p["t"])
+        p = self.bridge.player()          # re-read: _tv_position took a moment
+        if tv is None:
+            self._check_at = time.time() + 1.0   # the TV wasn't playing (buffering, still starting): look again soon
+            return
         if not p or p["id"] != self.current or p["paused"]:
             return
-        tv = self._tv_position(host)
-        p = self.bridge.player()          # re-read: _tv_position took a moment
-        if tv is None and self._retry < 5:
-            # The TV wasn't playing (buffering, still starting): look again in 2 s, not after the usual 20 s
-            self._retry += 1
-            self.last_check = time.time() - self.RECHECK + 2.0
-        elif tv is not None:
-            self._retry = 0
-        if tv is None or not p or p["id"] != self.current or p["paused"]:
+        drift = tv - p["t"]
+        if abs(drift) <= self.DRIFT:
             return
         if Remote.playlet_now(host).get("videoid") != self.current:
             # The TV is on a different video (it picked the next one, or someone used the remote). Its clock says nothing
             # about this one: following it jumped the PC to a random point, and the page's seek then reloaded the TV.
             log("align skipped: the TV is not playing the video the PC is on")
             return
-        drift = tv - p["t"]
-        if abs(drift) > self.DRIFT:
-            self._move_pc(tv + self.APPLY)
-            log(f"aligned PC player to TV (was {drift:+.2f}s off)")
+        if abs(drift) > self.BIG:
+            # One reading this far off is more often a lie (the TV still reporting the old position mid-switch) than a
+            # real jump: the log had the PC thrown +1016 s and back -1019 s four seconds later.
+            if not self._jump_holds(host):
+                log(f"align skipped: a {drift:+.0f}s reading didn't hold up")
+                return
+            tv2, p2 = self._tv_position(host), self.bridge.player()
+            if tv2 is None or not p2 or p2["id"] != self.current or p2["paused"]:
+                return
+            tv, drift = tv2, tv2 - p2["t"]
+        now = time.time()
+        self._moves = tuple(t for t in self._moves if now - t < 60) + (now,)
+        if len(self._moves) > self.MAX_MOVES:
+            # Corrections keep failing to hold: the PC can't keep up (a game, a slow connection). Moving it every two
+            # seconds only makes it rebuffer; ease off.
+            self._check_at = now + self.RECHECK
+            log(f"align easing off: {len(self._moves)} corrections in a minute (this PC can't keep up right now)")
+        else:
+            self._check_at = now + 1.5            # see that it landed: a YouTube seek lands a little late
+        self._move_pc(tv + self.APPLY)
+        log(f"aligned PC player to TV (was {drift:+.2f}s off)")
 
     ECHO = 8.0       # seconds during which a seek the page reports near our own nudge is that nudge coming back
 
@@ -791,6 +1110,8 @@ class CastSync:
         cmd = {"sync": round(target, 2), "syncId": self.current}
         if paused is not None:
             cmd["syncPaused"] = bool(paused)
+            # The pause / play this causes is the app's own, not something done on the PC.
+            self._pc_seen, self._pc_mine_until = (bool(paused), 0.0), time.time() + 1.0
         self._nudge = (self.current, target, time.time())
         self.bridge.send(cmd)
 
@@ -813,7 +1134,7 @@ class CastSync:
     def _resync(self, host):
         """Line the PC's player and the TV up now, whichever way they drifted. Returns what to tell the user."""
         pc = self.bridge.player()
-        st = Remote.state(host)
+        st = self._read(host)
         vid = Remote.playlet_now(host).get("videoid") or "" if st and st["app"] == "Playlet" else ""
         action, why = resync_plan(st, vid, pc, self.current)
         if action in ("nothing", "ad"):
@@ -823,6 +1144,7 @@ class CastSync:
             t0 = time.time()
             self._count(False, f"resync recast {pc['id']} at {target:.0f}s")
             Remote.cast(host, pc["id"], target, fresh=True)
+            self.clock.reset()
             self.current, self.title = pc["id"], self.title if pc["id"] == self.current else pc["id"]
             self._announce(self.title, self.current)
             self.settle_until = t0 + self.SETTLE
@@ -847,7 +1169,7 @@ class CastSync:
             end = time.time() + 6
             while time.time() < end:
                 time.sleep(0.5)
-                st = Remote.state(host)
+                st = self._read(host)
                 if st and st["state"] != "buffer":
                     break
             if not st or st["state"] == "buffer":
@@ -859,7 +1181,7 @@ class CastSync:
         so one shot is rarely exact."""
         first = None
         for _ in range(self.RESYNC_ROUNDS):
-            st = Remote.state(host)
+            st = self._read(host)
             pc = self.bridge.player()
             if not st or not pc or pc["id"] != self.current:
                 return False, "Lost track of one of the two players; try again"
@@ -879,7 +1201,7 @@ class CastSync:
             self._move_pc(tv + (0 if tv_paused else self.APPLY), paused=tv_paused)
             time.sleep(1.4)                            # the page applies it on its next poll, then settles
         else:
-            pc, st = self.bridge.player(), Remote.state(host)
+            pc, st = self.bridge.player(), self._read(host)
             left = abs((st["pos"] if st else 0) - pc["t"]) if pc and st else 0
             if left > 1.0:
                 return False, f"Moved the PC {abs(first or 0):.1f} s, but it is still about {left:.1f} s apart"
@@ -894,13 +1216,24 @@ class CastSync:
         time.sleep(max(0.0, self.settle_until - time.time()))
         deadline = time.time() + 8
         while time.time() < deadline:
-            st = Remote.state(host)
+            st = self._read(host)
             state = st and st["state"]
             if state in ("play", "pause"):
                 if state != want:
                     Remote.key(host, "Play")
+                    self._until_tv(host, want)
                 return
             time.sleep(0.4)   # buffering / starting up
+
+    def _until_tv(self, host, want, tries=16):
+        """Wait (up to ~2.4 s) for the TV to show the state we just asked for. The drift watch takes a TV that disagrees
+        with the PC for half a second as a pause made on the TV itself, so it mustn't see the TV mid-way through ours."""
+        for _ in range(tries):
+            st = self._read(host)
+            if st and st["state"] == want:
+                return True
+            time.sleep(0.15)
+        return False
 
 
 class TvVolume:
@@ -977,10 +1310,35 @@ class Listener:
         self.stop_evt = threading.Event()
         self.threads, self.sock, self.proc, self.sdp_path, self.loop = [], None, None, None, None
         self.ws_task, self.failed = None, False
+        self.ffmpeg, self.err_file, self._restarts = None, None, []
+        # what each side is doing, for the one status line (see _say)
+        self.rtp_seen = self.rtp_silent = False
+        self.audio_state, self.playing_on, self._said = "", "", None
 
     def _fail(self, text):
         self.failed = True
+        self._said = text
         self.on_status(text, ended=True)
+
+    def _say(self):
+        """One status line from what the network and the sound card are doing (each thread knows only its half: the
+        first packet used to say "Connected - playing" while no sound card was open)."""
+        wanted = short_device_name(self.device) if self.device else "the sound output"
+        if self.audio_state == "waiting":
+            text = f"Connecting… waiting for {wanted} to come on"
+        elif self.audio_state == "lost":
+            text = "Audio device lost, reconnecting…"
+        elif not self.rtp_seen:
+            text = "Connecting…"
+        elif self.rtp_silent:
+            text = "No audio from the Roku"
+        elif self.audio_state == "fallback":
+            text = f"Connected - playing on {self.playing_on} ({wanted} isn't on)"
+        else:
+            text = "Connected - playing"
+        if text != self._said:
+            self._said = text
+            self.on_status(text)
 
     # ---- lifecycle -------------------------------------------------------
     def start(self):
@@ -1005,16 +1363,42 @@ class Listener:
         self.concealing = has_libopus(ffmpeg)
         log("decoder: " + ("libopus, lost packets are concealed" if self.concealing
                            else "FFmpeg's own Opus decoder (no libopus): lost packets leave gaps"))
-        self.proc = subprocess.Popen(
-            decoder_command(ffmpeg, self.sdp_path, "libopus" if self.concealing else ""),
-            # its own file: a child's inherited handle doesn't really append on Windows, so it overwrites log() lines
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=open(LOG + ".ffmpeg", "w"), creationflags=NO_WINDOW)
+        self.ffmpeg = ffmpeg
+        self._spawn_decoder()
 
         for fn in (self._rtp_loop, self._audio_loop, self._ws_thread):
             t = threading.Thread(target=fn, daemon=True)
             t.start()
             self.threads.append(t)
-        self.on_status("Connecting…")
+        self._say()
+
+    def _spawn_decoder(self):
+        if self.err_file is None:
+            # its own file: a child's inherited handle doesn't really append on Windows, so it overwrites log() lines
+            self.err_file = open(log_path() + ".ffmpeg", "w")
+        self.proc = subprocess.Popen(
+            decoder_command(self.ffmpeg, self.sdp_path, "libopus" if self.concealing else ""),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=self.err_file, creationflags=NO_WINDOW)
+
+    def _restart_decoder(self):
+        """FFmpeg stopped while the session is still on: start a fresh one on the same stream (at most 3 a minute)."""
+        now = time.monotonic()
+        self._restarts = [t for t in self._restarts if now - t < 60] + [now]
+        if len(self._restarts) > 3 or not self.ffmpeg or self.stop_evt.is_set():
+            return False
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.kill()
+            self._spawn_decoder()
+        except Exception as e:
+            log(f"decoder restart failed: {e!r}")
+            return False
+        old, proc = self.buffer, self.proc
+        self.buffer = AudioBuffer(lambda n: proc.stdout.read(n), self.buffer_ms, self.stop_evt)
+        if old is not None:
+            self.buffer.underruns, self.buffer.dropped = old.underruns, old.dropped
+        log("audio decoder restarted")
+        return True
 
     def stop(self):
         self.stop_evt.set()
@@ -1027,6 +1411,16 @@ class Listener:
                 pass
         if self.proc:
             self.proc.terminate()
+            try:
+                # Gone before the next session starts its own: two decoders can't listen on the same port.
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+        if self.err_file:
+            try:
+                self.err_file.close()
+            except OSError:
+                pass
         if self.sdp_path:
             try:
                 os.unlink(self.sdp_path)
@@ -1071,8 +1465,8 @@ class Listener:
                 if started and now - last_pkt > 1.5:
                     log(f"no RTP for {now - last_pkt:.1f}s (packets so far: {count})")
                 if started and not silent and now - last_pkt > SILENCE_AFTER:
-                    silent = True
-                    self.on_status("No audio from the Roku")
+                    silent = self.rtp_silent = True
+                    self._say()
                 continue
             except ConnectionResetError:
                 continue                       # see send(): not a real failure
@@ -1097,8 +1491,8 @@ class Listener:
             if prev is None or ((int.from_bytes(data[2:4], "big") - int.from_bytes(prev[2:4], "big")) & 0xFFFF) < 0x8000:
                 prev = data
             if silent:
-                silent = False
-                self.on_status("Connected - playing")
+                silent = self.rtp_silent = False
+                self._say()
             if not started:
                 started = True
                 send(rtcp_app(b"VDLY", self.delay_us), roku)
@@ -1106,35 +1500,76 @@ class Listener:
                 send(RTCP_RR, roku)
                 last_rr = time.monotonic()
                 log("first RTP packet received")
-                self.on_status("Connected - playing")
+                self.rtp_seen = True
+                self._say()
 
     def _audio_loop(self):
-        """Decoded audio to the speakers. If the output device goes away (unplugged, driver reset, a sleep/wake) it
-        is reopened for up to DEVICE_RETRY seconds instead of ending the session."""
-        gave_up_at = None
+        """Decoded audio to the speakers.
+
+        PortAudio's list of devices is made again first: it only knew the devices there when the app started, so one that
+        came on later (SteelSeries Sonar starting after CapoCast) was missed and the sound went to the default output
+        instead, without a word: connected, but no sound where you listen. If the chosen output still isn't there it is
+        waited for (DEVICE_WAIT), then the default is used, saying so, until the chosen one appears. Each copy of the
+        device (Windows has one per audio API) is tried in turn; a lost device is reopened for up to DEVICE_RETRY seconds
+        instead of ending the session; a decoder that stops is restarted."""
+        gave_up_at = waiting_since = None
+        back_at, going_back = 0.0, False    # when a switch back to the chosen output may be tried; one is under way
         if self.buffer is None:
             self.buffer = AudioBuffer(lambda n: self.proc.stdout.read(n), self.buffer_ms, self.stop_evt)
+        self._rescan_devices()
         while not self.stop_evt.is_set():
+            choices, fallback = output_choices(self.device), False
+            if not choices:                                # the chosen output isn't there (yet)
+                if going_back:                             # Windows lists it, but it can't be opened yet
+                    back_at = time.monotonic() + 30
+                else:
+                    waiting_since = waiting_since or time.monotonic()
+                    if time.monotonic() - waiting_since < DEVICE_WAIT:
+                        if self.audio_state != "waiting":
+                            log(f"audio: waiting for {self.device!r} to come on")
+                        self.audio_state = "waiting"
+                        self._say()
+                        self.stop_evt.wait(2.0)
+                        self._rescan_devices()
+                        continue
+                choices, fallback = [None], True
+            going_back = False
             try:
-                with sd.RawOutputStream(samplerate=48000, channels=2, dtype="int16", blocksize=960, latency="low",
-                                        device=self.device_index()) as out:
+                with self._open(choices) as out:
                     gave_up_at = None
                     self.reopen = False
                     self.out_latency = float(getattr(out, "latency", 0) or 0)
                     self.buffer.retarget(self.buffer_ms / 1000)
+                    if fallback:
+                        self.audio_state, self.playing_on = "fallback", default_output_name()
+                        log(f"audio: {self.device!r} isn't there, playing on {self.playing_on}")
+                    else:
+                        self.audio_state, waiting_since = "ok", None
+                    self._say()
+                    look_at = time.monotonic() + 3.0
                     while not self.stop_evt.is_set() and not self.reopen:
+                        if fallback and time.monotonic() >= look_at:
+                            look_at = time.monotonic() + 3.0
+                            if time.monotonic() >= back_at and device_is_live(self.device):
+                                log(f"audio: {self.device!r} came on, switching to it")
+                                self.reopen = going_back = True    # the chosen output appeared: go to it
+                                break
                         buf = self.buffer.get()
                         if buf is None:
                             if not self.buffer.finished():
                                 continue                 # still filling: look at stop / reopen again
-                            if not self.stop_evt.is_set():
-                                log(f"ffmpeg exited rc={self.proc.poll()}")
-                                self._fail("Audio decoder stopped - see RokuListen.log in %APPDATA%")
+                            if self.stop_evt.is_set():
+                                return
+                            log(f"ffmpeg exited rc={self.proc.poll()}")
+                            if self._restart_decoder():
+                                continue
+                            self._fail("Audio decoder stopped - see RokuListen.log in %APPDATA%")
                             return
                         v = self.volume
                         out.write(buf if v == 1.0 else audioop.mul(buf, 2, v))
                 if self.reopen:
                     log("audio: switching output device")
+                    self._rescan_devices()
                     continue
             except Exception as e:
                 if self.stop_evt.is_set():
@@ -1145,11 +1580,24 @@ class Listener:
                     self._fail(f"Audio error: {e}")
                     return
                 log(f"audio device problem, retrying: {e!r}")
-                self.on_status("Audio device lost, reconnecting…")
+                self.audio_state = "lost"
+                self._say()
                 self._rescan_devices()
                 self.stop_evt.wait(1.5)
-                if not self.stop_evt.is_set():
-                    self.on_status("Connected - playing")
+
+    def _open(self, choices):
+        """An output stream on the first of `choices` (device indices) that opens; the last error if none does."""
+        err = None
+        for idx in choices:
+            try:
+                with SD_LOCK:
+                    return sd.RawOutputStream(samplerate=48000, channels=2, dtype="int16", blocksize=960, latency="low",
+                                              device=idx)
+            except Exception as e:
+                err = e
+                if len(choices) > 1:
+                    log(f"audio: output {idx} wouldn't open ({e!r}), trying its next copy")
+        raise err
 
     def set_buffer(self, ms):
         """Move the sound earlier or later right now (from the Sound delay slider)."""
@@ -1163,12 +1611,14 @@ class Listener:
 
     @staticmethod
     def _rescan_devices():
-        """PortAudio only lists the devices present when it started; restart it so a reconnected one is seen."""
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception as e:
-            log(f"audio rescan failed: {e!r}")
+        """PortAudio only lists the devices present when it started; restart it so one that came on since is seen.
+        (Only while this session has no stream open.)"""
+        with SD_LOCK:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as e:
+                log(f"audio rescan failed: {e!r}")
 
     def _ws_thread(self):
         self.loop = asyncio.new_event_loop()
@@ -2446,19 +2896,38 @@ class App(tk.Tk):
         so a stall seen from the YouTube page can be blamed on the right side."""
         def run():
             while True:
-                t = time.monotonic()
+                t, s0 = time.monotonic(), health.suspended_seconds()
                 time.sleep(0.25)
                 late = time.monotonic() - t - 0.25
                 if late >= health.APP_LATE:
-                    self.health.app_late(late)
+                    s1 = health.suspended_seconds()
+                    slept = (s1 - s0) if (s0 is not None and s1 is not None) else None
+                    if slept is not None and slept >= 5:              # the PC slept: not a freeze, but things to mend
+                        self.health.pc_slept(slept)
+                        self._after_safe(lambda s=slept: self._resumed(s))
+                    late = health.split_late(late, slept)
+                    if late >= health.APP_LATE:
+                        self.health.app_late(late)
         threading.Thread(target=run, name="watchdog", daemon=True).start()
 
+    def _resumed(self, slept):
+        """The PC just woke up. Local connections may have been dropped while it slept (the Web tab's link to its browser
+        did, on 2026-11-08, and stayed down until a restart), so have them checked now rather than at their next timer."""
+        log(f"PC woke up after {slept:.0f}s asleep")
+        try:
+            self.web.on_resume()
+        except Exception as e:
+            log(f"resume: web tab: {e!r}")
+
     def _poll(self):
-        now = time.monotonic()
-        due = getattr(self, "_poll_due", None)
-        if due is not None and now - due >= health.APP_LATE:      # the window's own loop was kept waiting
-            self.health.app_late(now - due)
-        self._poll_due = now + 1.0
+        now, slept_now = time.monotonic(), health.suspended_seconds()
+        due, slept_then = getattr(self, "_poll_due", None), getattr(self, "_poll_slept", None)
+        if due is not None:                                       # the window's own loop was kept waiting (sleep aside)
+            slept = (slept_now - slept_then) if (slept_now is not None and slept_then is not None) else None
+            late = health.split_late(now - due, slept)
+            if late >= health.APP_LATE:
+                self.health.app_late(late)
+        self._poll_due, self._poll_slept = now + 1.0, slept_now
         if not self._polling:
             self._polling = True
             host = self.host.get().strip() or DEFAULT_HOST
@@ -2908,6 +3377,9 @@ class App(tk.Tk):
             self.connect()
 
     def connect(self):
+        stopping = getattr(self, "_stopping", None)
+        if stopping is not None and stopping.is_alive():
+            stopping.join(3)                 # the last session must let go of its ports first, or the new one can't hear
         listener = Listener(self.host.get().strip() or DEFAULT_HOST, self._delay(), self.set_status, self._buffer())
         listener.volume = self.pc_volume / 100
         listener.device = self.audio_device
@@ -2931,7 +3403,8 @@ class App(tk.Tk):
 
     def disconnect(self, keep_status=False):
         if self.listener:
-            threading.Thread(target=self.listener.stop, daemon=True).start()
+            self._stopping = threading.Thread(target=self.listener.stop, daemon=True)
+            self._stopping.start()
             self.listener = None
         if not keep_status:
             self.status.set("Not connected")

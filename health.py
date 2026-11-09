@@ -17,6 +17,31 @@ EVENTS_SHOWN = 14
 APP, CHROME, LINK, UNKNOWN = "app", "browser", "extension link", "unknown"
 
 
+def suspended_seconds():
+    """Seconds this PC has spent asleep or hibernating since it booted, or None if it can't be told (not Windows).
+
+    A watchdog that wakes hours late looks exactly like a frozen app unless sleep is subtracted. Windows keeps two clocks
+    that differ by exactly the time asleep: GetTickCount64 counts it, QueryUnbiasedInterruptTime doesn't."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetTickCount64.restype = ctypes.c_ulonglong
+        unbiased = ctypes.c_ulonglong()
+        if not k32.QueryUnbiasedInterruptTime(ctypes.byref(unbiased)):
+            return None
+        return max(0.0, k32.GetTickCount64() / 1000.0 - unbiased.value / 1e7)
+    except Exception:
+        return None
+
+
+def split_late(late, slept):
+    """How much of `late` seconds of lateness the app itself is to blame for, given `slept` seconds of PC sleep in that
+    time (None = unknown). Sleep isn't a freeze."""
+    if slept is None:
+        return late
+    return max(0.0, late - slept)
+
+
 def classify(gap, app_late=0.0, timer_gap=0.0, rtt=0.0):
     """Who stalled when polls from the page went `gap` seconds without arriving.
 
@@ -93,6 +118,11 @@ class Health:
         if seconds >= APP_LATE:
             self.note("stall-app", f"{seconds:.1f}s")
 
+    def pc_slept(self, seconds):
+        """The PC was asleep or hibernating for `seconds`. Not a stall: nothing froze, the whole machine was off."""
+        if seconds >= 5:
+            self.note("pc-asleep", f"{seconds:.0f}s")
+
     def page_poll(self, timer_gap=0.0, rtt=0.0):
         """The YouTube page polled the app. `timer_gap` and `rtt` are what the page measured (seconds, 0 = not given)."""
         now = self.clock()
@@ -123,7 +153,7 @@ class Health:
                 "buffers": kinds["tv-buffer"], "buffer_seconds": sum(float(d.rstrip("s")) for d in buffered),
                 "stalls": {"app": kinds["stall-app"], "browser": kinds["stall-browser"], "link": kinds["stall-extension"],
                            "unknown": kinds["stall-unknown"]},
-                "tv_down": kinds["tv-unreachable"],
+                "tv_down": kinds["tv-unreachable"], "asleep": kinds["pc-asleep"],
                 "recent": [(now - t, k, d) for t, k, d in list(self.events)[-EVENTS_SHOWN:]][::-1],
             }
 
@@ -135,7 +165,7 @@ class Health:
                  f"Last 30 min: {s['reloads']} Playlet reloads ({s['reloads_skipped']} avoided), "
                  f"{s['buffers']} TV buffering ({s['buffer_seconds']:.0f}s), {s['tv_down']} TV unreachable",
                  f"Stalls: app {s['stalls']['app']}, browser {s['stalls']['browser']}, extension link {s['stalls']['link']}, "
-                 f"unknown {s['stalls']['unknown']}"]
+                 f"unknown {s['stalls']['unknown']}" + (f"  (PC asleep {s['asleep']}x, not counted)" if s["asleep"] else "")]
         lines += [str(x) for x in (extra or [])]
         lines += ["", "Recent:"] + [f"  {ago:5.0f}s ago  {k}  {d}" for ago, k, d in s["recent"]]
         return "\n".join(lines)

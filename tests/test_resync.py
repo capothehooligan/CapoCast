@@ -261,24 +261,23 @@ class Sync(unittest.TestCase):
         cast_call.assert_called_once()
 
     # ---- the automatic check no longer sleeps for 20 s when the TV could not be measured ----------------------
-    def test_a_tv_that_could_not_be_measured_is_looked_at_again_in_two_seconds(self):
+    def test_a_tv_that_could_not_be_measured_is_looked_at_again_within_a_second(self):
         s = self.sync(FakeBridge(100.0))
         with mock.patch.object(s, "_tv_position", return_value=None):
             s._align("h")
-        due_in = s.last_check + s.RECHECK - time.time()
-        self.assertTrue(1.0 < due_in <= 2.0, due_in)
+        due_in = s._check_at - time.time()
+        self.assertTrue(0.5 < due_in <= 1.0, due_in)
 
-    def test_it_gives_up_quick_checks_after_five_so_a_long_pause_is_not_polled_forever(self):
-        s = self.sync(FakeBridge(100.0))
-        with mock.patch.object(s, "_tv_position", return_value=None):
+    def test_a_paused_tv_costs_one_cheap_look_a_second_never_precise_polling(self):
+        s = self.sync(FakeBridge(100.0, paused=True))
+        paused = {"state": "pause", "app": "Playlet", "pos": 100.0, "dur": 900}
+        with mock.patch.object(g.Remote, "state", return_value=paused) as look, \
+                mock.patch.object(s, "_tv_position") as precise:
             for _ in range(8):
-                s._align("h")
-        self.assertEqual(s._retry, 5)
-        self.assertLess(s.last_check + s.RECHECK - time.time(), 20.01)
-        s.last_check = 0.0
-        with mock.patch.object(s, "_tv_position", return_value=100.0):
-            s._align("h")
-        self.assertEqual(s._retry, 0)
+                s._watch_at = 0.0
+                s._watch("h")
+        precise.assert_not_called()
+        self.assertEqual(look.call_count, 8)
 
 
 class Extension(unittest.TestCase):

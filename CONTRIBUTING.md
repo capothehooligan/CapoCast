@@ -55,6 +55,7 @@ To build the standalone `.exe`:
 | `yt_bridge.py` | Local HTTP bridge (`127.0.0.1:8765`) between the app and the extension |
 | `web_tab.py` | The Web tab: toolbar, headless Brave lifecycle, and the Cast flow |
 | `web_view.py` | Draws the headless browser's page on a canvas and forwards mouse / keyboard (key translation is pure and unit tested) |
+| `tv_clock.py` | Where the TV really is in the video, from cheap position readings that may lag in steps. Pure, unit tested; both sync engines use it |
 | `web_sync.py` | Keeps the TV following the page's video after a Web cast (pause, play, scrub). Pure logic over injected TV / relay / guard objects, so it's unit tested with fakes |
 | `web_guard.py` | Drives Brave over DevTools: pop-up / redirect / click-trap guards, stream capture, screencast, input, and the page's play / pause / seek events |
 | `stream_finder.py` | Chooses the real video among decoys. Pure logic, no I/O |

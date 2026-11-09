@@ -321,6 +321,7 @@ roku-listen/
 ├── web_tab.py             # Web tab: toolbar, Brave lifecycle, Cast flow
 ├── web_view.py            # draws the headless browser's page and forwards mouse / keyboard
 ├── web_sync.py            # keeps the TV following the page's video (pause, play, scrub)
+├── tv_clock.py            # where the TV really is, from position readings that lag in steps (both syncs use it)
 ├── web_guard.py           # DevTools guard: pop-ups, redirects, click traps, stream capture, screencast
 ├── stream_finder.py       # picks the real video out of the decoys (pure logic)
 ├── media_relay.py         # serves a stream to the Roku with the site's headers; HLS rewriting

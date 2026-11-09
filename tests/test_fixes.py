@@ -196,6 +196,49 @@ class OutputDevice(unittest.TestCase):
         self.assertEqual(opened, [None, 3])
 
 
+class OutputDeviceComingOn(unittest.TestCase):
+    """Connect with the chosen output missing (SteelSeries Sonar not started yet): wait, then use the default and say so."""
+
+    def run_loop(self, choices_seq, live=False):
+        statuses, opened = [], []
+
+        class Out:
+            latency = 0.0
+
+            def __init__(self, **kw):
+                opened.append(kw["device"])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def write(self, buf):
+                if len(opened) >= 2 or not live:
+                    ln.stop_evt.set()
+
+        seq = iter(choices_seq)
+        ln = g.Listener("10.0.0.5", 500, lambda text, ended=False: statuses.append(text))
+        ln.device = "SteelSeries Sonar - Media (SteelSeries Sonar Virtual Audio Device)"
+        ln.rtp_seen = True
+        ln.proc = SimpleNamespace(stdout=SimpleNamespace(read=lambda n: b"\0" * n), poll=lambda: None)
+        ln.stop_evt.wait = lambda t=None: False
+        with mock.patch.object(g.sd, "RawOutputStream", Out), mock.patch.object(g.Listener, "_rescan_devices"),                 mock.patch.object(g, "output_choices", side_effect=lambda name: next(seq, [7]) if name else [None]),                 mock.patch.object(g, "default_output_name", return_value="Speakers"),                 mock.patch.object(g, "device_is_live", return_value=live), mock.patch.object(g, "DEVICE_WAIT", 0.0):
+            ln._audio_loop()
+        return statuses, opened
+
+    def test_a_missing_output_falls_back_to_the_default_and_says_so(self):
+        statuses, opened = self.run_loop([[], []])
+        self.assertEqual(opened, [None])
+        self.assertIn("Connected - playing on Speakers (SteelSeries Sonar - Media isn't on)", statuses)
+
+    def test_the_decoder_waits_through_silence_instead_of_quitting_after_10_s(self):
+        cmd = g.decoder_command("ff", "x.sdp")
+        self.assertEqual(cmd[cmd.index("-listen_timeout") + 1], "-1")
+        self.assertLess(cmd.index("-listen_timeout"), cmd.index("-i"))
+
+
 class CastCleanup(Base):
     def setUp(self):
         super().setUp()
@@ -808,6 +851,17 @@ class YoutubePipeline(unittest.TestCase):
             s._align("tv")
         self.assertEqual(moved, [])
         with mock.patch.object(g.Remote, "playlet_now", return_value={"videoid": "v1"}), \
-                mock.patch.object(s, "_tv_position", return_value=300.0):
+                mock.patch.object(s, "_tv_position", return_value=300.0), \
+                mock.patch.object(s, "_jump_holds", return_value=True):     # a jump this big is watched before it counts
             s._align("tv")
         self.assertEqual(len(moved), 1)
+
+    def test_a_big_jump_that_does_not_hold_up_leaves_the_pc_alone(self):
+        s = self.sync()
+        moved = []
+        s.bridge = SimpleNamespace(player=lambda: {"id": "v1", "t": 5.0, "paused": False}, send=moved.append)
+        with mock.patch.object(g.Remote, "playlet_now", return_value={"videoid": "v1"}), \
+                mock.patch.object(s, "_tv_position", return_value=300.0), \
+                mock.patch.object(s, "_jump_holds", return_value=False):
+            s._align("tv")
+        self.assertEqual(moved, [])

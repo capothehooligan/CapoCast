@@ -328,8 +328,15 @@ class MediaRelay:
         parts = ["", "s", parts[2], name]                             # the handlers below only look at the file name
         sess.hits += 1
         headers = dict(sess.headers)
+        rewritten = name.endswith(".m3u8") or (sess.kind == "dash" and name == "manifest.mpd")
         if h.headers.get("Range"):
-            headers["Range"] = h.headers["Range"]
+            if rewritten:
+                # A playlist is rewritten before the TV sees it, so a byte range of the site's copy means nothing
+                # here, and a site that honours it hands back a fragment the TV rejects as a corrupt playlist
+                # ("reader pick stream error ... invalid or corrupt playlist"). The whole playlist is sent instead.
+                self.log(f"relay: TV asked for {h.headers['Range']} of {name}; sending the whole playlist")
+            else:
+                headers["Range"] = h.headers["Range"]
         try:
             resp = urllib.request.urlopen(urllib.request.Request(upstream, headers=headers), timeout=20)
         except urllib.error.HTTPError as e:
